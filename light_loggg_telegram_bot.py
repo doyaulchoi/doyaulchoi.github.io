@@ -175,6 +175,11 @@ def format_status(state_file: Path) -> str:
     speed = as_float(last.get("speed_kmh"))
     odometer = as_float(last.get("odometer_km"))
     next_seconds = last.get("next_seconds")
+    
+    # 충전 관련 정보 추출
+    charging_state = last.get("charging_state")
+    charge_power = as_float(last.get("charge_energy_added"))
+    
     lines = [
         "LIGHT LOGGG 상태",
         f"프로세스: {running_text}",
@@ -182,6 +187,13 @@ def format_status(state_file: Path) -> str:
         f"Tesla 상태: {last.get('status') or '-'}",
         f"최근 폴링: {last_text}",
     ]
+    
+    # 충전 중일 때 상태 표시 추가
+    if charging_state and charging_state != "Disconnected":
+        lines.append(f"⚡ 충전 상태: {charging_state}")
+        if charge_power is not None:
+            lines.append(f"🔌 충전량: {charge_power:.1f} kWh 추가됨")
+
     if isinstance(next_seconds, (int, float)):
         lines.append(f"다음 주기: {int(next_seconds)}초")
     if battery is not None:
