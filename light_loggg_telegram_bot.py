@@ -1,125 +1,323 @@
-import os
+#!/usr/bin/env python3
+"""Telegram command listener for LIGHT LOGGG Tesla polling.
+
+The Tesla polling process sends proactive alerts, while this process listens for
+Telegram commands such as /status, /daily, and /weekly. It is intentionally
+separate so the Tesla API polling loop remains simple and resilient on Termux.
+"""
+
+from __future__ import annotations
+
 import json
-import requests
+import os
 import subprocess
+import sys
 import time
-import logging
+import signal
+import shutil
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional
 
-# 설정 로드
-CONFIG_PATH = os.path.expanduser("~/.light_loggg_config.json")
-STATE_PATH = os.path.expanduser("~/.light_loggg_state.json")
+import requests
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(os.path.expanduser("~/light_loggg_bot.log")),
-        logging.StreamHandler()
-    ]
-)
+KST = timezone(timedelta(hours=9))
+REQUEST_TIMEOUT = int(os.getenv("LIGHT_LOGGG_REQUEST_TIMEOUT", "25"))
+DEFAULT_STATE_FILE = Path.home() / ".light_loggg_state.json"
+DEFAULT_PID_FILE = Path.home() / "light_loggg_tesla" / "polling.pid"
+DEFAULT_LOG_FILE = Path.home() / "light_loggg_tesla" / "logs" / "polling.log"
+POLLING_SCRIPT_PATH = Path(__file__).parent / "light_loggg_tesla_polling.py"
 
-def load_config():
-    if not os.path.exists(CONFIG_PATH):
+
+def load_dotenv(path: Path = Path(".env")) -> None:
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"").strip("\'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def now_kst() -> datetime:
+    return datetime.now(KST)
+
+
+def load_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
+    if not path.exists():
+        return dict(default)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return dict(default)
+
+
+def as_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
         return None
-    with open(CONFIG_PATH, 'r') as f:
-        return json.load(f)
 
-def get_offset():
-    if os.path.exists(STATE_PATH):
-        with open(STATE_PATH, 'r') as f:
-            state = json.load(f)
-            return state.get("bot_offset", 0)
+
+def parse_dt(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def process_alive(pid_file: Path = DEFAULT_PID_FILE) -> Optional[bool]:
+    if not pid_file.exists():
+        return None
+    try:
+        pid_text = pid_file.read_text(encoding="utf-8").strip()
+        pid = int(pid_text)
+    except Exception:
+        return None
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return None
+
+
+def tail_log(log_file: Path = DEFAULT_LOG_FILE, lines: int = 3) -> str:
+    if not log_file.exists():
+        return "로그 파일 없음"
+    try:
+        result = subprocess.run(
+            ["tail", "-n", str(lines), str(log_file)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        text = (result.stdout or result.stderr or "").strip()
+        return text[-1200:] if text else "최근 로그 없음"
+    except Exception:
+        return "로그 확인 실패"
+
+
+def format_daily_summary(state: Dict[str, Any]) -> str:
+    daily = state.get('daily') or {}
+    distance = float(daily.get('total_distance_km') or 0)
+    seconds = float(daily.get('total_time_seconds') or 0)
+    avg_speed = distance / (seconds / 3600) if seconds > 0 else 0
+    effs = daily.get('efficiencies') or []
+    avg_eff = sum(effs) / len(effs) if effs else 0
+    start_soc = daily.get('start_soc')
+    end_soc = daily.get('end_soc')
+    if isinstance(start_soc, (int, float)) and isinstance(end_soc, (int, float)):
+        soc_text = f"{start_soc:.0f}% -> {end_soc:.0f}% ({start_soc - end_soc:.0f}%p 사용)"
+    else:
+        soc_text = "확인 부족"
+    return (
+        f"오늘의 주행 요약 {daily.get('date') or '-'}\n"
+        f"주행거리 {distance:.2f} km\n"
+        f"주행시간 {seconds / 60:.0f}분\n"
+        f"평균속도 {avg_speed:.1f} km/h\n"
+        f"평균전비 {avg_eff:.2f} km/kWh\n"
+        f"배터리 {soc_text}\n"
+        f"주행횟수 {len(daily.get('drive_sessions') or [])}회\n"
+        f"급가속 {int(daily.get('accel_count') or 0)}회, 급감속 {int(daily.get('decel_count') or 0)}회"
+    )
+
+
+def format_weekly_summary(state: Dict[str, Any]) -> str:
+    weekly = state.get('weekly') or {}
+    distance = float(weekly.get('total_distance_km') or 0)
+    seconds = float(weekly.get('total_time_seconds') or 0)
+    energy = float(weekly.get('total_energy_kwh') or 0)
+    avg_eff = distance / energy if energy > 0 else 0
+    return (
+        f"주간 주행 요약 {weekly.get('week') or '-'}\n"
+        f"누적거리 {distance:.2f} km\n"
+        f"누적시간 {seconds / 60:.0f}분\n"
+        f"평균전비 {avg_eff:.2f} km/kWh\n"
+        f"주행횟수 {int(weekly.get('drive_count') or 0)}회"
+    )
+
+
+def format_status(state_file: Path) -> str:
+    state = load_json(state_file, {})
+    last = state.get('last_poll') or {}
+    running = process_alive()
+    running_text = "확인됨" if running is True else "중지됨" if running is False else "PID 파일 없음"
+
+    last_time = parse_dt(last.get('time'))
+    if last_time:
+        age_seconds = max(0, int((now_kst() - last_time.astimezone(KST)).total_seconds()))
+        last_text = f"{last_time.astimezone(KST).strftime('%H:%M:%S')} ({age_seconds}초 전)"
+    else:
+        last_text = "기록 없음"
+
+    battery = as_float(last.get('battery_level'))
+    speed = as_float(last.get('speed_kmh'))
+    odometer = as_float(last.get('odometer_km'))
+    next_seconds = last.get('next_seconds')
+    lines = [
+        "LIGHT LOGGG 상태",
+        f"프로세스: {running_text}",
+        f"차량: {last.get('vehicle_name') or '-'}",
+        f"Tesla 상태: {last.get('status') or '-'}",
+        f"최근 폴링: {last_text}",
+    ]
+    if isinstance(next_seconds, (int, float)):
+        lines.append(f"다음 주기: {int(next_seconds)}초")
+    if battery is not None:
+        lines.append(f"배터리: {battery:.0f}%")
+    if speed is not None:
+        lines.append(f"속도: {speed:.1f} km/h")
+    if odometer is not None:
+        lines.append(f"누적 주행거리: {odometer:.1f} km")
+    lines.append("최근 로그:")
+    lines.append(tail_log())
+    return "\n".join(lines)
+
+
+def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
+    repo_path = Path(__file__).parent
+    try:
+        # 1. Git pull
+        telegram_bot.send(chat_id, "🔄 코드 업데이트 중...")
+        result = subprocess.run(
+            ["git", "pull"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True
+        )
+        telegram_bot.send(chat_id, f"✅ Git pull 완료:\n```\n{result.stdout.strip()}\n```")
+
+        # 2. Stop existing polling process
+        telegram_bot.send(chat_id, "🛑 기존 폴링 프로세스 중지 중...")
+        if DEFAULT_PID_FILE.exists():
+            try:
+                pid = int(DEFAULT_PID_FILE.read_text().strip())
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(5) # Give it some time to terminate
+                if process_alive(DEFAULT_PID_FILE):
+                    os.kill(pid, signal.SIGKILL) # Force kill if still alive
+                DEFAULT_PID_FILE.unlink(missing_ok=True)
+                telegram_bot.send(chat_id, f"✅ 폴링 프로세스 (PID: {pid}) 중지 완료.")
+            except (ValueError, ProcessLookupError, OSError) as e:
+                telegram_bot.send(chat_id, f"⚠️ 폴링 프로세스 중지 실패: {e}")
+        else:
+            telegram_bot.send(chat_id, "ℹ️ PID 파일이 없어 중지할 폴링 프로세스가 없습니다.")
+
+        # 3. Restart polling script
+        telegram_bot.send(chat_id, "🚀 새 폴링 프로세스 시작 중...")
+        # Ensure log directory exists
+        DEFAULT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Find python3 executable
+        python_executable = shutil.which("python3")
+        if not python_executable:
+            raise RuntimeError("python3 실행 파일을 찾을 수 없습니다.")
+
+        # Start the polling script in a detached process
+        with open(DEFAULT_LOG_FILE, "a") as log_output:
+            subprocess.Popen(
+                [python_executable, str(POLLING_SCRIPT_PATH)],
+                cwd=repo_path,
+                stdout=log_output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True
+            )
+        telegram_bot.send(chat_id, "✅ 새 폴링 프로세스 시작 명령 완료. 로그를 확인해주세요.")
+
+    except subprocess.CalledProcessError as e:
+        telegram_bot.send(chat_id, f"❌ 명령어 실행 실패: {e}\n```\n{e.stdout}\n{e.stderr}\n```")
+    except Exception as e:
+        telegram_bot.send(chat_id, f"❌ 업데이트 및 재시작 중 오류 발생: {e}")
+
+
+class TelegramBot:
+    def __init__(self, state_file: Path) -> None:
+        self.token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+        self.chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        self.state_file = state_file
+        self.offset = 0
+        if not self.token:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN 또는 TELEGRAM_TOKEN 환경변수가 필요합니다.")
+
+    def send(self, chat_id: str, text: str) -> None:
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        res = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=REQUEST_TIMEOUT)
+        if res.status_code >= 400:
+            print(f"Telegram sendMessage HTTP {res.status_code}: {res.text[:200]}", file=sys.stderr)
+
+    def allowed(self, chat_id: str) -> bool:
+        if self.chat_id:
+            return str(chat_id) == str(self.chat_id)
+        self.chat_id = str(chat_id)
+        return True
+
+    def handle(self, chat_id: str, text: str) -> None:
+        command = (text or "").strip().split()[0].lower()
+        state = load_json(self.state_file, {})
+        
+        if command in {"/start", "start"}:
+            self.send(chat_id, "LIGHT LOGGG 명령: /status, /daily, /weekly, /update")
+        elif command in {"/status", "status"}:
+            self.send(chat_id, format_status(self.state_file))
+        elif command in {"/daily", "daily"}:
+            self.send(chat_id, format_daily_summary(state))
+        elif command in {"/weekly", "weekly"}:
+            self.send(chat_id, format_weekly_summary(state))
+        elif command in {"/update", "update"}:
+            update_and_restart_polling(self, chat_id)
+        else:
+            self.send(chat_id, "알 수 없는 명령어입니다. 사용 가능한 명령어: /status, /daily, /weekly, /update")
+
+    def run_forever(self) -> None:
+        print("LIGHT LOGGG Telegram command bot started", flush=True)
+        while True:
+            try:
+                url = f"https://api.telegram.org/bot{self.token}/getUpdates"
+                res = requests.get(url, params={"offset": self.offset + 1, "timeout": 25}, timeout=35)
+                data = res.json()
+                if not data.get("ok"):
+                    print(f"Telegram getUpdates error: {data}", file=sys.stderr, flush=True)
+                    time.sleep(5)
+                    continue
+                for update in data.get("result", []):
+                    self.offset = max(self.offset, int(update.get("update_id", 0)))
+                    msg = update.get("message") or {}
+                    text = msg.get("text") or ""
+                    chat_id = str((msg.get("chat") or {}).get("id") or "")
+                    if not chat_id:
+                        continue
+                    if not self.allowed(chat_id):
+                        continue
+                    self.handle(chat_id, text)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                print(f"Telegram bot error: {exc}", file=sys.stderr, flush=True)
+                time.sleep(5)
+
+
+def main() -> int:
+    load_dotenv(Path(".env"))
+    load_dotenv(Path.home() / ".light_loggg.env")
+    state_file = Path(os.getenv("LIGHT_LOGGG_STATE_FILE", str(DEFAULT_STATE_FILE))).expanduser()
+    TelegramBot(state_file).run_forever()
     return 0
 
-def save_offset(offset):
-    state = {}
-    if os.path.exists(STATE_PATH):
-        with open(STATE_PATH, 'r') as f:
-            state = json.load(f)
-    state["bot_offset"] = offset
-    with open(STATE_PATH, 'w') as f:
-        json.dump(state, f)
-
-def send_message(token, chat_id, text):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": text})
-
-def handle_update(config):
-    repo_url = "https://raw.githubusercontent.com/doyaulchoi/doyaulchoi.github.io/main/light_loggg_tesla"
-    files = ["light_loggg_telegram_bot.py", "light_loggg_tesla_polling.py"]
-    
-    results = []
-    for file in files:
-        cmd = f"curl -L {repo_url}/{file} -o ~/light_loggg_tesla/{file}"
-        process = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        if process.returncode == 0:
-            results.append(f"✅ {file} 업데이트 성공")
-        else:
-            results.append(f"❌ {file} 업데이트 실패: {process.stderr}")
-    
-    msg = "🔄 시스템 업데이트 결과:\n" + "\n".join(results)
-    msg += "\n\n시스템을 재시작합니다..."
-    send_message(config['telegram_token'], config['chat_id'], msg)
-    
-    # 프로세스 재시작 로직
-    # 1. 폴링 프로세스 종료 및 재시작
-    subprocess.run("pkill -f light_loggg_tesla_polling.py", shell=True)
-    subprocess.run("nohup python3 ~/light_loggg_tesla/light_loggg_tesla_polling.py > ~/light_loggg_polling.log 2>&1 &", shell=True)
-    
-    # 2. 봇 프로세스 재시작 (자기 자신을 다시 실행하고 현재 프로세스 종료)
-    os.execv('/usr/bin/python3', ['python3', os.path.expanduser('~/light_loggg_tesla/light_loggg_telegram_bot.py')])
-
-def main():
-    config = load_config()
-    if not config:
-        logging.error("Config not found")
-        return
-
-    token = config['telegram_token']
-    offset = get_offset()
-    
-    logging.info("Telegram Bot Started")
-    
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout=30"
-            response = requests.get(url).json()
-            
-            if response.get("ok"):
-                for update in response.get("result", []):
-                    offset = update["update_id"] + 1
-                    save_offset(offset)
-                    
-                    message = update.get("message", {})
-                    text = message.get("text", "")
-                    chat_id = message.get("chat", {}).get("id")
-                    
-                    if str(chat_id) != str(config['chat_id']):
-                        continue
-
-                    if text == "/status":
-                        # 폴링 스크립트가 저장한 최신 상태 읽기
-                        if os.path.exists(STATE_PATH):
-                            with open(STATE_PATH, 'r') as f:
-                                state = json.load(f)
-                            status_msg = f"📊 현재 상태: {state.get('last_charging_state', '알 수 없음')}"
-                        else:
-                            status_msg = "📊 상태 정보를 불러올 수 없습니다."
-                        send_message(token, chat_id, status_msg)
-                    
-                    elif text == "/update":
-                        handle_update(config)
-                    
-                    elif text.startswith("/"):
-                        help_msg = ("❓ 알 수 없는 명령어입니다.\n\n"
-                                    "사용 가능한 명령어:\n"
-                                    "/status - 현재 차량 상태 확인\n"
-                                    "/update - 시스템 최신 버전 업데이트")
-                        send_message(token, chat_id, help_msg)
-                        
-        except Exception as e:
-            logging.error(f"Error in bot loop: {e}")
-            time.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
