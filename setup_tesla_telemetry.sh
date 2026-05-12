@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# Tesla Fleet Telemetry Setup Script for Termux (Android) - V3 (Remote Update Support)
+# Tesla Fleet Telemetry Setup Script for Termux (Android) - V4 (Path Fix)
 # Author: Manus AI (for doyaulchoi)
 
 echo "🚀 Starting Tesla Telemetry System on Mi Pad..."
 
-# 1. Basic Environment Setup (First time only)
+# 1. Basic Environment Setup
 if ! command -v go &> /dev/null; then
     echo "📦 Initializing environment..."
     pkg update -y
@@ -18,12 +18,37 @@ cd $HOME
 # 2. Infinite Loop for Auto-Update Support
 while true; do
     echo "🔄 Fetching/Updating latest scripts from GitHub..."
-    wget -O tesla_telemetry_handler.py https://raw.githubusercontent.com/doyaulchoi/doyaulchoi.github.io/main/tesla_telemetry_handler.py
+    wget -q -O tesla_telemetry_handler.py https://raw.githubusercontent.com/doyaulchoi/doyaulchoi.github.io/main/tesla_telemetry_handler.py
     
-    # Check if telemetry server exists, if not build it
+    # Clean up and Re-clone if directory structure is messy
     if [ ! -d "fleet-telemetry" ]; then
+        echo "📂 Cloning Tesla Fleet Telemetry repository..."
         git clone https://github.com/teslamotors/fleet-telemetry.git
-        cd fleet-telemetry && go build -o tesla-telemetry ./cmd/telemetry && cd ..
+    fi
+    
+    cd $HOME/fleet-telemetry
+    
+    # Ensure binary exists
+    if [ ! -f "./tesla-telemetry" ]; then
+        echo "🔨 Building Telemetry Server..."
+        go build -o tesla-telemetry ./cmd/telemetry
+    fi
+
+    # Create config if not exists
+    if [ ! -f "config.json" ]; then
+        echo "⚙️ Creating configuration..."
+        cat <<EOF > config.json
+{
+  "host": "0.0.0.0",
+  "port": 8080,
+  "log_level": "info",
+  "storage": {
+    "type": "file",
+    "path": "$HOME/tesla_data_logs"
+  }
+}
+EOF
+        mkdir -p $HOME/tesla_data_logs
     fi
 
     # Start Cloudflare Tunnel if not running
@@ -40,13 +65,13 @@ while true; do
 
     # 3. Run the system
     echo "🚀 Launching Telemetry Monitor..."
-    # If update_trigger exists, remove it
     rm -f $HOME/update_trigger
     
-    # Run server and pipe to handler
-    ./fleet-telemetry/tesla-telemetry -config ./fleet-telemetry/config.json | python $HOME/tesla_telemetry_handler.py
+    # Run server and pipe to handler (using absolute paths to be safe)
+    ./tesla-telemetry -config ./config.json | python $HOME/tesla_telemetry_handler.py
     
     # If the process exits, check if it was an update request
+    cd $HOME
     if [ -f "$HOME/update_trigger" ]; then
         echo "🔄 Update trigger detected. Restarting system..."
         sleep 2
