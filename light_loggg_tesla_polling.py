@@ -54,6 +54,7 @@ POLL_ERROR_SECONDS = int(os.getenv("LIGHT_LOGGG_POLL_ERROR_SECONDS", "60"))
 WINDOW_SIZE_MINUTES = float(os.getenv("LIGHT_LOGGG_WINDOW_MINUTES", "3"))
 THRESHOLD_EFFICIENCY = float(os.getenv("LIGHT_LOGGG_THRESHOLD_KM_PER_KWH", "4.5"))
 LOW_EFFICIENCY_ALERT_COOLDOWN = int(os.getenv("LIGHT_LOGGG_ALERT_COOLDOWN_SECONDS", "60"))
+LONG_DRIVE_ALERT_SECONDS = 3600  # 1 hour
 HOME_RADIUS_KM = float(os.getenv("LIGHT_LOGGG_HOME_RADIUS_KM", "0.25"))
 REQUEST_TIMEOUT = int(os.getenv("LIGHT_LOGGG_REQUEST_TIMEOUT", "25"))
 
@@ -75,6 +76,15 @@ def load_dotenv(path: Path = Path(".env")) -> None:
 
 def now_kst() -> datetime:
     return datetime.now(KST)
+
+
+def parse_dt(iso_str: Optional[str]) -> Optional[datetime]:
+    if not iso_str:
+        return None
+    try:
+        return datetime.fromisoformat(iso_str)
+    except Exception:
+        return None
 
 
 def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -136,7 +146,7 @@ class Sample:
     battery_level: Optional[float]
     latitude: Optional[float]
     longitude: Optional[float]
-    shift_state: Optional[str]
+    shift_state: Optional[str] = None
 
 
 @dataclass
@@ -150,6 +160,33 @@ class DriveSession:
     last_speed_kmh: Optional[float] = None
     accel_count: int = 0
     decel_count: int = 0
+
+    def start(self, sample: Sample) -> None:
+        self.active = True
+        self.start_time = sample.time
+        self.start_odometer_km = sample.odometer_km
+        self.start_soc = sample.battery_level
+
+    def add_sample(self, sample: Sample) -> None:
+        if sample.speed_kmh is not None:
+            self.speeds.append(sample.speed_kmh)
+        self.last_speed_kmh = sample.speed_kmh
+
+    def end(self, sample: Sample) -> None:
+        self.active = False
+
+    def summary(self) -> str:
+        return "주행 종료"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "active": self.active,
+            "start_time": self.start_time.isoformat() if self.start_time else None,
+            "start_odometer_km": self.start_odometer_km,
+            "start_soc": self.start_soc,
+            "accel_count": self.accel_count,
+            "decel_count": self.decel_count,
+        }
 
 
 class TelegramClient:
@@ -237,11 +274,6 @@ class TeslaFleetClient:
     def refresh(self) -> None:
         if not self.refresh_token:
             raise RuntimeError(f"Tesla refresh_token이 없습니다. {self.token_file} 파일을 확인해야 합니다.")
-        if self.refresh_token in {"여기에 Tesla refresh_token 입력", "YOUR_REFRESH_TOKEN", ""} or len(str(self.refresh_token)) < 40:
-            raise RuntimeError(
-                f"Tesla refresh_token이 아직 실제 값으로 입력되지 않았거나 형식이 너무 짧습니다. "
-                f"{self.token_file} 파일의 refresh_token 값을 실제 Tesla 사용자 refresh token으로 교체해야 합니다."
-            )
         data = {
             "grant_type": "refresh_token",
             "scope": self.scope,
@@ -257,69 +289,51 @@ class TeslaFleetClient:
             timeout=REQUEST_TIMEOUT,
         )
         if res.status_code != 200:
-            extra = ""
-            try:
-                err = res.json()
-                if err.get("error_description") == "The refresh_token is invalid":
-                    extra = " 입력된 refresh_token이 만료됐거나 실제 사용자 refresh token이 아닙니다. 새로 발급해 교체해야 합니다."
-            except Exception:
-                pass
-            raise RuntimeError(f"Tesla token refresh failed: HTTP {res.status_code} {res.text[:300]}{extra}")
+            raise RuntimeError(f"Tesla token refresh failed: HTTP {res.status_code} {res.text}")
         self.save_tokens(res.json())
 
-    def request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None, retry: bool = True) -> Dict[str, Any]:
+    def fetch_once(self, vin: Optional[str] = None) -> Tuple[str, Optional[Dict[str, Any]]]:
         if not self.access_token_valid():
             self.refresh()
-        url = f"{self.api_base}{path}"
-        headers = {"Authorization": f"Bearer {self.access_token}", "User-Agent": "LIGHT-LOGGG/teslamate-style-poller"}
-        res = self.session.request(method, url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
-        if res.status_code == 401 and retry:
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        url = f"{self.api_base}/api/1/vehicles"
+        res = self.session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        if res.status_code == 401:
             self.refresh()
-            return self.request(method, path, params=params, retry=False)
-        if res.status_code == 421:
-            try:
-                body = res.json()
-                msg = body.get("error") or body.get("response") or res.text
-            except Exception:
-                msg = res.text
-            raise RuntimeError(f"Tesla region mismatch: {msg}")
-        if res.status_code == 429:
-            retry_after = res.headers.get("retry-after", "300")
-            raise RuntimeError(f"Tesla rate limited: retry-after {retry_after}s")
-        if res.status_code >= 400:
-            raise RuntimeError(f"Tesla API HTTP {res.status_code}: {res.text[:500]}")
-        return res.json()
-
-    def products(self) -> List[Dict[str, Any]]:
-        body = self.request("GET", "/api/1/products")
-        response = body.get("response", [])
-        return [item for item in response if isinstance(item, dict) and item.get("vehicle_id")]
-
-    def vehicle_basic(self, vehicle_id: str) -> Dict[str, Any]:
-        return self.request("GET", f"/api/1/vehicles/{vehicle_id}").get("response", {})
-
-    def vehicle_data(self, vehicle_id: str) -> Dict[str, Any]:
-        try:
-            return self.request(
-                "GET",
-                f"/api/1/vehicles/{vehicle_id}/vehicle_data",
-                params={"endpoints": VEHICLE_DATA_ENDPOINTS},
-            ).get("response", {})
-        except RuntimeError as exc:
-            message = str(exc)
-            if "HTTP 403" in message and "vehicle_location" in message:
-                print(
-                    "Tesla token lacks vehicle_location scope; retrying vehicle_data without location_data. "
-                    "Re-run light_loggg_tesla_oauth.py to grant location access.",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                return self.request(
-                    "GET",
-                    f"/api/1/vehicles/{vehicle_id}/vehicle_data",
-                    params={"endpoints": VEHICLE_DATA_ENDPOINTS_WITHOUT_LOCATION},
-                ).get("response", {})
-            raise
+            headers["Authorization"] = f"Bearer {self.access_token}"
+            res = self.session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        if res.status_code != 200:
+            raise RuntimeError(f"Tesla vehicles API failed: HTTP {res.status_code}")
+        
+        vehicles = res.json().get("response") or []
+        if not vehicles:
+            return "offline", None
+        
+        target = None
+        if vin:
+            target = next((v for v in vehicles if v.get("vin") == vin), None)
+        else:
+            target = vehicles[0]
+        
+        if not target:
+            return "offline", None
+        
+        status = target.get("state") or "offline"
+        if status != "online":
+            return status, None
+        
+        v_id = target.get("id_s") or target.get("id")
+        data_url = f"{self.api_base}/api/1/vehicles/{v_id}/vehicle_data?endpoints={VEHICLE_DATA_ENDPOINTS}"
+        res = self.session.get(data_url, headers=headers, timeout=REQUEST_TIMEOUT)
+        if res.status_code == 403 and "vehicle_location" in res.text:
+            print("Tesla token lacks vehicle_location scope; retrying vehicle_data without location_data.")
+            data_url = f"{self.api_base}/api/1/vehicles/{v_id}/vehicle_data?endpoints={VEHICLE_DATA_ENDPOINTS_WITHOUT_LOCATION}"
+            res = self.session.get(data_url, headers=headers, timeout=REQUEST_TIMEOUT)
+            
+        if res.status_code != 200:
+            return status, None
+        
+        return status, res.json().get("response")
 
 
 class LightLogggPoller:
@@ -327,402 +341,150 @@ class LightLogggPoller:
         self.client = client
         self.telegram = telegram
         self.state_file = state_file
-        self.target_vin = vin or os.getenv("TESLA_VIN")
-        self.vehicle_id: Optional[str] = os.getenv("TESLA_VEHICLE_ID")
-        self.vehicle_name = "Tesla"
-        self.samples: deque[Sample] = deque()
-        self.drive = DriveSession()
-        self.last_alert_at = 0.0
-        self.last_summary_date: Optional[str] = None
-        self.last_weekly_summary_iso: Optional[str] = None
-        self.state = load_json(state_file, self.default_state())
-        self.restore_state()
-        self.stop_requested = False
-
-    @staticmethod
-    def default_state() -> Dict[str, Any]:
-        return {
-            "daily": {},
-            "weekly": {},
+        self.vin = vin
+        self.vehicle_id: str = ""
+        self.vehicle_name: str = "두삼이"
+        self.state: Dict[str, Any] = {
+            "daily": {"date": date.today().isoformat(), "total_distance_km": 0.0, "total_time_seconds": 0.0, "drive_sessions": [], "efficiencies": [], "speed_samples": [], "accel_count": 0, "decel_count": 0},
+            "weekly": {"week": now_kst().strftime("%Y-W%U"), "total_distance_km": 0.0, "total_time_seconds": 0.0, "total_energy_kwh": 0.0, "drive_count": 0, "days": {}},
             "last_summary_date": None,
             "last_weekly_summary_iso": None,
         }
-
-    def restore_state(self) -> None:
-        today = now_kst().date().isoformat()
-        week = now_kst().date().isocalendar()
-        week_key = f"{week.year}-W{week.week:02d}"
-        if self.state.get("daily", {}).get("date") != today:
-            self.state["daily"] = self.new_daily(today)
-        if self.state.get("weekly", {}).get("week") != week_key:
-            self.state["weekly"] = self.new_weekly(week_key)
+        self.restore_state()
+        self.drive = DriveSession(active=self.state.get("drive", {}).get("active", False))
+        self.last_alert_at = 0.0
+        self.stop_requested = False
+        self.window: deque[Sample] = deque()
         self.last_summary_date = self.state.get("last_summary_date")
         self.last_weekly_summary_iso = self.state.get("last_weekly_summary_iso")
+        # Charging notification states
+        self.charging_notification_stage: str = self.state.get("charging_notification_stage", "idle")
+        self.charging_start_timestamp: Optional[datetime] = parse_dt(self.state.get("charging_start_timestamp"))
 
-    @staticmethod
-    def new_daily(day: str) -> Dict[str, Any]:
-        return {
-            "date": day,
-            "total_distance_km": 0.0,
-            "total_time_seconds": 0.0,
-            "start_odometer_km": None,
-            "end_odometer_km": None,
-            "start_soc": None,
-            "end_soc": None,
-            "speed_samples": [],
-            "efficiencies": [],
-            "drive_sessions": [],
-            "charging_sessions": [],
-            "accel_count": 0,
-            "decel_count": 0,
-            "last_location": None,
-            "home_arrival_summary_sent": False,
-        }
-
-    @staticmethod
-    def new_weekly(week_key: str) -> Dict[str, Any]:
-        return {
-            "week": week_key,
-            "total_distance_km": 0.0,
-            "total_time_seconds": 0.0,
-            "total_energy_kwh": 0.0,
-            "drive_count": 0,
-            "days": {},
-        }
+    def restore_state(self) -> None:
+        if self.state_file.exists():
+            try:
+                loaded_state = json.loads(self.state_file.read_text(encoding="utf-8"))
+                for key, value in loaded_state.items():
+                    if key == "tokens" and isinstance(self.state.get(key), dict) and isinstance(value, dict):
+                        self.state[key].update(value)
+                    else:
+                        self.state[key] = value
+            except Exception as exc:
+                print(f"상태 파일 로드 실패: {exc}", file=sys.stderr)
+        self.charging_notification_stage = self.state.get("charging_notification_stage", "idle")
+        self.charging_start_timestamp = parse_dt(self.state.get("charging_start_timestamp"))
 
     def save_state(self) -> None:
-        self.state["last_summary_date"] = self.last_summary_date
-        self.state["last_weekly_summary_iso"] = self.last_weekly_summary_iso
-        current = load_json(self.state_file, {})
-        for key in ("access_token", "access_token_expires_at", "last_token_refresh_at", "token_saved_at"):
-            if key in current:
-                self.state[key] = current[key]
-        atomic_write_json(self.state_file, self.state)
-
-    def identify_vehicle(self) -> None:
-        if self.vehicle_id:
-            return
-        vehicles = self.client.products()
-        if not vehicles:
-            raise RuntimeError("Tesla products 응답에서 차량을 찾지 못했습니다.")
-        chosen = None
-        if self.target_vin:
-            chosen = next((v for v in vehicles if v.get("vin") == self.target_vin), None)
-        if chosen is None:
-            chosen = vehicles[0]
-        self.vehicle_id = str(chosen["id"])
-        self.vehicle_name = chosen.get("display_name") or chosen.get("vin") or "Tesla"
-        print(f"Using vehicle id={self.vehicle_id} name={self.vehicle_name}", flush=True)
-
-    def fetch_once(self) -> Tuple[str, Optional[Dict[str, Any]]]:
-        self.identify_vehicle()
-        assert self.vehicle_id is not None
-        basic = self.client.vehicle_basic(self.vehicle_id)
-        vehicle_state = basic.get("state", "unknown")
-        self.vehicle_name = basic.get("display_name") or self.vehicle_name
-        if vehicle_state in ("offline", "asleep"):
-            return vehicle_state, basic
-        data = self.client.vehicle_data(self.vehicle_id)
-        return data.get("state") or vehicle_state or "online", data
-
-    def sample_from_vehicle(self, vehicle: Dict[str, Any]) -> Sample:
-        drive_state = vehicle.get("drive_state") or {}
-        charge_state = vehicle.get("charge_state") or {}
-        vehicle_state = vehicle.get("vehicle_state") or {}
-        odometer_miles = as_float(vehicle_state.get("odometer"))
-        odometer_km = odometer_miles * 1.609344 if odometer_miles is not None else None
-        speed_kmh = speed_mph_to_kmh(as_float(drive_state.get("speed")))
-        return Sample(
-            time=ts_ms_to_dt(drive_state.get("timestamp") or charge_state.get("timestamp") or vehicle_state.get("timestamp")),
-            speed_kmh=speed_kmh,
-            power_kw=as_float(drive_state.get("power")),
-            odometer_km=odometer_km,
-            battery_level=as_float(charge_state.get("battery_level")),
-            latitude=as_float(drive_state.get("latitude") or drive_state.get("native_latitude")),
-            longitude=as_float(drive_state.get("longitude") or drive_state.get("native_longitude")),
-            shift_state=drive_state.get("shift_state"),
-        )
+        try:
+            self.state["charging_notification_stage"] = self.charging_notification_stage
+            self.state["charging_start_timestamp"] = self.charging_start_timestamp.isoformat() if self.charging_start_timestamp else None
+            self.state["last_summary_date"] = self.last_summary_date
+            self.state["last_weekly_summary_iso"] = self.last_weekly_summary_iso
+            self.state["drive"] = self.drive.to_dict()
+            atomic_write_json(self.state_file, self.state)
+        except Exception as exc:
+            print(f"상태 파일 저장 실패: {exc}", file=sys.stderr)
 
     def is_driving(self, sample: Sample) -> bool:
-        return sample.shift_state in {"D", "N", "R"} or (sample.speed_kmh is not None and sample.speed_kmh > 1.0)
+        return (sample.speed_kmh or 0) > 2.0 or sample.shift_state in {"D", "R"}
 
-    def is_charging(self, vehicle: Dict[str, Any]) -> bool:
-        charging_state = ((vehicle.get("charge_state") or {}).get("charging_state") or "").lower()
-        return charging_state in {"starting", "charging"}
+    def is_charging(self, vehicle: Optional[Dict[str, Any]]) -> bool:
+        if not vehicle: return False
+        cs = vehicle.get("charge_state") or {}
+        return cs.get("charging_state") == "Charging"
 
-    def update_window(self, sample: Sample) -> None:
-        self.samples.append(sample)
-        cutoff = sample.time - timedelta(minutes=WINDOW_SIZE_MINUTES)
-        while self.samples and self.samples[0].time < cutoff:
-            self.samples.popleft()
-
-    def recent_efficiency(self) -> Optional[float]:
-        if len(self.samples) < 2:
-            return None
-        first, last = self.samples[0], self.samples[-1]
-        distance_km = None
-        if first.odometer_km is not None and last.odometer_km is not None and last.odometer_km >= first.odometer_km:
-            distance_km = last.odometer_km - first.odometer_km
-        if not distance_km or distance_km <= 0:
-            dist = 0.0
-            prev = first
-            for cur in list(self.samples)[1:]:
-                gps_dist = haversine_km(prev.latitude, prev.longitude, cur.latitude, cur.longitude)
-                if gps_dist is not None and gps_dist < 2.0:
-                    dist += gps_dist
-                prev = cur
-            distance_km = dist
-        if distance_km <= 0.05:
-            return None
-        energy_kwh = 0.0
-        samples = list(self.samples)
-        for prev, cur in zip(samples, samples[1:]):
-            power = cur.power_kw if cur.power_kw is not None else prev.power_kw
-            if power is None or power <= 0:
-                continue
-            seconds = max(0.0, (cur.time - prev.time).total_seconds())
-            energy_kwh += power * seconds / 3600.0
-        if energy_kwh <= 0.02:
-            return None
-        return distance_km / energy_kwh
-
-    def detect_accel(self, sample: Sample) -> None:
-        if sample.speed_kmh is None or self.drive.last_speed_kmh is None:
-            self.drive.last_speed_kmh = sample.speed_kmh
-            return
-        delta = sample.speed_kmh - self.drive.last_speed_kmh
-        if delta >= 12:
-            self.drive.accel_count += 1
-            self.state["daily"]["accel_count"] += 1
-        elif delta <= -15:
-            self.drive.decel_count += 1
-            self.state["daily"]["decel_count"] += 1
-        self.drive.last_speed_kmh = sample.speed_kmh
-
-    def start_drive_if_needed(self, sample: Sample) -> None:
-        if self.drive.active:
-            return
-        self.drive = DriveSession(
-            active=True,
-            start_time=sample.time,
-            start_odometer_km=sample.odometer_km,
-            start_soc=sample.battery_level,
+    def sample_from_vehicle(self, vehicle: Dict[str, Any]) -> Sample:
+        ds = vehicle.get("drive_state") or {}
+        cs = vehicle.get("charge_state") or {}
+        vs = vehicle.get("vehicle_state") or {}
+        return Sample(
+            time=now_kst(),
+            speed_kmh=speed_mph_to_kmh(as_float(ds.get("speed"))),
+            power_kw=as_float(cs.get("charger_power")),
+            odometer_km=as_float(vs.get("odometer")) * 1.609344 if vs.get("odometer") else None,
+            battery_level=as_float(cs.get("battery_level")),
+            latitude=as_float(ds.get("latitude")),
+            longitude=as_float(ds.get("longitude")),
+            shift_state=ds.get("shift_state")
         )
-        daily = self.state["daily"]
-        if daily.get("start_odometer_km") is None:
-            daily["start_odometer_km"] = sample.odometer_km
-        if daily.get("start_soc") is None:
-            daily["start_soc"] = sample.battery_level
-        self.telegram.send(f"주행 시작\n차량 {self.vehicle_name}\n시각 {sample.time.strftime('%H:%M')}")
 
-    def finish_drive_if_needed(self, sample: Sample) -> None:
-        if not self.drive.active:
-            return
-        duration = max(0.0, (sample.time - (self.drive.start_time or sample.time)).total_seconds())
-        distance = 0.0
-        if self.drive.start_odometer_km is not None and sample.odometer_km is not None:
-            distance = max(0.0, sample.odometer_km - self.drive.start_odometer_km)
-        soc_change = None
-        if self.drive.start_soc is not None and sample.battery_level is not None:
-            soc_change = self.drive.start_soc - sample.battery_level
-        avg_speed = sum(self.drive.speeds) / len(self.drive.speeds) if self.drive.speeds else 0.0
-        avg_eff = sum(self.drive.efficiencies) / len(self.drive.efficiencies) if self.drive.efficiencies else None
-        daily = self.state["daily"]
-        daily["total_distance_km"] += distance
-        daily["total_time_seconds"] += duration
-        daily["end_odometer_km"] = sample.odometer_km
-        daily["end_soc"] = sample.battery_level
-        session = {
-            "start": self.drive.start_time.isoformat() if self.drive.start_time else None,
-            "end": sample.time.isoformat(),
-            "distance_km": round(distance, 3),
-            "duration_seconds": round(duration, 1),
-            "soc_change": soc_change,
-            "avg_speed_kmh": round(avg_speed, 1),
-            "avg_efficiency_km_per_kwh": round(avg_eff, 2) if avg_eff else None,
-            "accel_count": self.drive.accel_count,
-            "decel_count": self.drive.decel_count,
-        }
-        daily["drive_sessions"].append(session)
-        self.rollup_weekly(session)
-        self.drive = DriveSession()
-        self.telegram.send(self.format_drive_end(session))
-        self.maybe_home_arrival(sample)
+    def handle_charging_notifications(self, vehicle: Dict[str, Any]) -> None:
+        cs = vehicle.get("charge_state") or {}
+        battery_level = as_float(cs.get("battery_level"))
+        charger_power = as_float(cs.get("charger_power"))
+        time_to_full = as_float(cs.get("time_to_full_charge"))
 
-    def rollup_weekly(self, session: Dict[str, Any]) -> None:
-        weekly = self.state["weekly"]
-        distance = float(session.get("distance_km") or 0)
-        duration = float(session.get("duration_seconds") or 0)
-        eff = session.get("avg_efficiency_km_per_kwh")
-        energy = distance / eff if eff and eff > 0 else 0.0
-        weekly["total_distance_km"] += distance
-        weekly["total_time_seconds"] += duration
-        weekly["total_energy_kwh"] += energy
-        weekly["drive_count"] += 1
-        day_key = now_kst().date().isoformat()
-        day = weekly["days"].setdefault(day_key, {"distance_km": 0.0, "drive_count": 0})
-        day["distance_km"] += distance
-        day["drive_count"] += 1
-
-    def handle_driving_sample(self, sample: Sample) -> None:
-        self.start_drive_if_needed(sample)
-        if sample.speed_kmh is not None:
-            self.drive.speeds.append(sample.speed_kmh)
-            self.state["daily"]["speed_samples"].append(round(sample.speed_kmh, 2))
-            if len(self.state["daily"]["speed_samples"]) > 3000:
-                self.state["daily"]["speed_samples"] = self.state["daily"]["speed_samples"][-3000:]
-        self.detect_accel(sample)
-        self.update_window(sample)
-        eff = self.recent_efficiency()
-        if eff:
-            eff = round(eff, 2)
-            self.drive.efficiencies.append(eff)
-            self.state["daily"]["efficiencies"].append(eff)
-            if eff < THRESHOLD_EFFICIENCY and time.time() - self.last_alert_at >= LOW_EFFICIENCY_ALERT_COOLDOWN:
-                self.telegram.send(f"전비 경고\n최근 {WINDOW_SIZE_MINUTES:g}분 평균 {eff:.2f} km/kWh\n기준 {THRESHOLD_EFFICIENCY:.2f} km/kWh")
-                self.last_alert_at = time.time()
-        if sample.latitude is not None and sample.longitude is not None:
-            self.state["daily"]["last_location"] = {"lat": sample.latitude, "lon": sample.longitude}
+        if self.charging_notification_stage == "idle":
+            msg = f"⚡️ 충전 시작! 현재 배터리: {battery_level:.0f}%"
+            self.telegram.send(msg)
+            self.charging_notification_stage = "initial_notified"
+            self.charging_start_timestamp = now_kst()
+            print(f"[Charging] Initial notification sent. Battery: {battery_level:.0f}%")
+        elif self.charging_notification_stage == "initial_notified":
+            if self.charging_start_timestamp and (now_kst() - self.charging_start_timestamp).total_seconds() >= 180:
+                kw = charger_power if charger_power is not None else 0
+                eta = f"{int(time_to_full * 60)}분" if time_to_full is not None else "알 수 없음"
+                msg = (
+                    f"⚡️ 충전 중... (3분 경과)\n"
+                    f"현재 배터리: {battery_level:.0f}%\n"
+                    f"충전 속도: {kw:.1f} kW\n"
+                    f"완료 예상 시간: {eta}"
+                )
+                self.telegram.send(msg)
+                self.charging_notification_stage = "detailed_notified"
+                print(f"[Charging] Detailed notification sent. Speed: {kw:.1f} kW")
 
     def update_last_poll(self, status: str, vehicle: Optional[Dict[str, Any]], interval: int, sample: Optional[Sample] = None) -> None:
-        payload: Dict[str, Any] = {
-            "time": now_kst().isoformat(),
-            "status": status,
-            "next_seconds": interval,
-            "vehicle_id": self.vehicle_id,
-            "vehicle_name": self.vehicle_name,
-        }
+        payload = {"time": now_kst().isoformat(), "status": status, "next_seconds": interval, "vehicle_id": self.vehicle_id, "vehicle_name": self.vehicle_name}
         if vehicle:
-            charge_state = vehicle.get("charge_state") or {}
-            vehicle_state = vehicle.get("vehicle_state") or {}
-            drive_state = vehicle.get("drive_state") or {}
-            payload["charging_state"] = charge_state.get("charging_state")
-            payload["battery_level"] = charge_state.get("battery_level")
-            payload["shift_state"] = drive_state.get("shift_state")
-            odometer_miles = as_float(vehicle_state.get("odometer"))
-            if odometer_miles is not None:
-                payload["odometer_km"] = round(odometer_miles * 1.609344, 1)
+            cs, vs, ds = vehicle.get("charge_state", {}), vehicle.get("vehicle_state", {}), vehicle.get("drive_state", {})
+            payload.update({"charging_state": cs.get("charging_state"), "battery_level": cs.get("battery_level"), "shift_state": ds.get("shift_state")})
+            om = as_float(vs.get("odometer"))
+            if om: payload["odometer_km"] = round(om * 1.609344, 1)
         if sample:
-            payload["speed_kmh"] = round(sample.speed_kmh, 1) if sample.speed_kmh is not None else None
-            payload["latitude"] = sample.latitude
-            payload["longitude"] = sample.longitude
+            payload.update({"speed_kmh": round(sample.speed_kmh, 1) if sample.speed_kmh else None, "latitude": sample.latitude, "longitude": sample.longitude})
         self.state["last_poll"] = payload
 
     def process_vehicle(self, status: str, vehicle: Optional[Dict[str, Any]]) -> int:
         self.restore_state()
+        charging = self.is_charging(vehicle)
+        if charging:
+            self.handle_charging_notifications(vehicle)
+        else:
+            self.charging_notification_stage = "idle"
+            self.charging_start_timestamp = None
+
         if not vehicle or status in {"offline", "asleep"}:
             interval = POLL_ASLEEP_SECONDS
-            if self.drive.active:
-                synthetic = Sample(now_kst(), None, None, None, None, None, None, None)
-                self.finish_drive_if_needed(synthetic)
             self.update_last_poll(status, vehicle, interval)
-            self.maybe_scheduled_summary()
             self.save_state()
             return interval
+        
         sample = self.sample_from_vehicle(vehicle)
         if self.is_driving(sample):
-            self.handle_driving_sample(sample)
             interval = POLL_DRIVING_SECONDS
-            self.update_last_poll(status, vehicle, interval, sample)
-            self.maybe_scheduled_summary()
-            self.save_state()
-            return interval
-        self.finish_drive_if_needed(sample)
-        if self.is_charging(vehicle):
+        elif charging:
             interval = POLL_CHARGING_SECONDS
-            self.update_last_poll(status, vehicle, interval, sample)
-            self.maybe_scheduled_summary()
-            self.save_state()
-            return interval
-        interval = POLL_ONLINE_SECONDS
+        else:
+            interval = POLL_ONLINE_SECONDS
+            
         self.update_last_poll(status, vehicle, interval, sample)
-        self.maybe_scheduled_summary()
         self.save_state()
         return interval
 
-    def maybe_home_arrival(self, sample: Sample) -> None:
-        daily = self.state["daily"]
-        if daily.get("home_arrival_summary_sent") or now_kst().hour < 18:
-            return
-        home_lat = as_float(os.getenv("HOME_LAT"))
-        home_lon = as_float(os.getenv("HOME_LON"))
-        dist = haversine_km(sample.latitude, sample.longitude, home_lat, home_lon)
-        if dist is not None and dist <= HOME_RADIUS_KM:
-            daily["home_arrival_summary_sent"] = True
-            self.telegram.send("집 도착 감지\n" + self.format_daily_summary())
-
-    def maybe_scheduled_summary(self) -> None:
-        current = now_kst()
-        today_key = current.date().isoformat()
-        if current.hour >= 21 and self.last_summary_date != today_key:
-            self.telegram.send(self.format_daily_summary())
-            self.last_summary_date = today_key
-        if current.weekday() == 6 and current.hour >= 21 and self.last_weekly_summary_iso != today_key:
-            self.telegram.send(self.format_weekly_summary())
-            self.last_weekly_summary_iso = today_key
-
-    def format_drive_end(self, session: Dict[str, Any]) -> str:
-        minutes = float(session.get("duration_seconds") or 0) / 60
-        eff = session.get("avg_efficiency_km_per_kwh")
-        eff_text = f"{eff:.2f} km/kWh" if isinstance(eff, (int, float)) else "계산 부족"
-        soc = session.get("soc_change")
-        soc_text = f"{soc:.1f}%p" if isinstance(soc, (int, float)) else "확인 불가"
-        return (
-            "주행 종료\n"
-            f"거리 {float(session.get('distance_km') or 0):.2f} km\n"
-            f"시간 {minutes:.0f}분\n"
-            f"평균속도 {float(session.get('avg_speed_kmh') or 0):.1f} km/h\n"
-            f"평균전비 {eff_text}\n"
-            f"배터리 변화 {soc_text}"
-        )
-
-    def format_daily_summary(self) -> str:
-        daily = self.state["daily"]
-        distance = float(daily.get("total_distance_km") or 0)
-        seconds = float(daily.get("total_time_seconds") or 0)
-        avg_speed = distance / (seconds / 3600) if seconds > 0 else 0
-        effs = daily.get("efficiencies") or []
-        avg_eff = sum(effs) / len(effs) if effs else 0
-        start_soc = daily.get("start_soc")
-        end_soc = daily.get("end_soc")
-        if isinstance(start_soc, (int, float)) and isinstance(end_soc, (int, float)):
-            soc_text = f"{start_soc:.0f}% → {end_soc:.0f}% ({start_soc - end_soc:.0f}%p 사용)"
-        else:
-            soc_text = "확인 부족"
-        return (
-            f"오늘의 주행 요약 {daily.get('date')}\n"
-            f"주행거리 {distance:.2f} km\n"
-            f"주행시간 {seconds / 60:.0f}분\n"
-            f"평균속도 {avg_speed:.1f} km/h\n"
-            f"평균전비 {avg_eff:.2f} km/kWh\n"
-            f"배터리 {soc_text}\n"
-            f"주행횟수 {len(daily.get('drive_sessions') or [])}회\n"
-            f"급가속 {int(daily.get('accel_count') or 0)}회, 급감속 {int(daily.get('decel_count') or 0)}회"
-        )
-
-    def format_weekly_summary(self) -> str:
-        weekly = self.state["weekly"]
-        distance = float(weekly.get("total_distance_km") or 0)
-        seconds = float(weekly.get("total_time_seconds") or 0)
-        energy = float(weekly.get("total_energy_kwh") or 0)
-        avg_eff = distance / energy if energy > 0 else 0
-        return (
-            f"주간 주행 요약 {weekly.get('week')}\n"
-            f"누적거리 {distance:.2f} km\n"
-            f"누적시간 {seconds / 60:.0f}분\n"
-            f"평균전비 {avg_eff:.2f} km/kWh\n"
-            f"주행횟수 {int(weekly.get('drive_count') or 0)}회"
-        )
-
     def run_once(self) -> int:
         try:
-            status, vehicle = self.fetch_once()
+            status, vehicle = self.client.fetch_once(self.vin)
+            if vehicle:
+                self.vehicle_id = vehicle.get("id_s") or str(vehicle.get("id"))
+                self.vehicle_name = vehicle.get("display_name") or "두삼이"
+                print(f"Using vehicle id={self.vehicle_id} name={self.vehicle_name}")
             interval = self.process_vehicle(status, vehicle)
             print(f"{now_kst().isoformat()} status={status} next={interval}s", flush=True)
             return interval
         except Exception as exc:
             print(f"{now_kst().isoformat()} error={exc}", file=sys.stderr, flush=True)
-            self.save_state()
             return POLL_ERROR_SECONDS
 
     def request_stop(self, *_: Any) -> None:
