@@ -190,59 +190,37 @@ def format_status(state_file: Path) -> str:
 def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
     repo_path = Path(__file__).parent
     try:
-        # 1. Git pull
-        telegram_bot.send(chat_id, "🔄 코드 업데이트 중...")
-        result = subprocess.run(
-            ["git", "pull"],
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=True
-        )
-        telegram_bot.send(chat_id, f"✅ Git pull 완료:\n```\n{result.stdout.strip()}\n```")
+        # 1. Curl update (로그인 없이 파일 직접 다운로드)
+        telegram_bot.send(chat_id, "🔄 코드 업데이트 중 (curl)...")
+        url = "https://raw.githubusercontent.com/doyaulchoi/doyaulchoi.github.io/main/light_loggg_telegram_bot.py"
+        result = subprocess.run(["curl", "-L", "-o", "light_loggg_telegram_bot.py", url], cwd=repo_path, capture_output=True, text=True )
+        
+        if result.returncode != 0:
+            telegram_bot.send(chat_id, f"❌ 업데이트 실패:\n{result.stderr}")
+            return
 
-        # 2. Stop existing polling process
+        # 2. 기존 폴링 프로세스 중지
         telegram_bot.send(chat_id, "🛑 기존 폴링 프로세스 중지 중...")
         if DEFAULT_PID_FILE.exists():
             try:
                 pid = int(DEFAULT_PID_FILE.read_text().strip())
                 os.kill(pid, signal.SIGTERM)
-                time.sleep(5) # Give it some time to terminate
+                time.sleep(2)
                 if process_alive(DEFAULT_PID_FILE):
-                    os.kill(pid, signal.SIGKILL) # Force kill if still alive
+                    os.kill(pid, signal.SIGKILL)
                 DEFAULT_PID_FILE.unlink(missing_ok=True)
-                telegram_bot.send(chat_id, f"✅ 폴링 프로세스 (PID: {pid}) 중지 완료.")
-            except (ValueError, ProcessLookupError, OSError) as e:
-                telegram_bot.send(chat_id, f"⚠️ 폴링 프로세스 중지 실패: {e}")
-        else:
-            telegram_bot.send(chat_id, "ℹ️ PID 파일이 없어 중지할 폴링 프로세스가 없습니다.")
+            except Exception:
+                pass
 
-        # 3. Restart polling script
-        telegram_bot.send(chat_id, "🚀 새 폴링 프로세스 시작 중...")
-        # Ensure log directory exists
-        DEFAULT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # 3. 봇 자체를 재시작 (새로 받은 코드를 적용하기 위함)
+        telegram_bot.send(chat_id, "✅ 업데이트 완료! 봇을 재시작하여 새 코드를 적용합니다...")
         
-        # Find python3 executable
-        python_executable = shutil.which("python3")
-        if not python_executable:
-            raise RuntimeError("python3 실행 파일을 찾을 수 없습니다.")
+        # 현재 실행 중인 파이썬 프로세스를 새 코드로 완전히 교체하여 재시작합니다.
+        # 이 과정에서 폴링 스크립트도 봇의 시작 로직에 따라 자동으로 다시 켜질 것입니다.
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
-        # Start the polling script in a detached process
-        with open(DEFAULT_LOG_FILE, "a") as log_output:
-            subprocess.Popen(
-                [python_executable, str(POLLING_SCRIPT_PATH)],
-                cwd=repo_path,
-                stdout=log_output,
-                stderr=subprocess.STDOUT,
-                start_new_session=True
-            )
-        telegram_bot.send(chat_id, "✅ 새 폴링 프로세스 시작 명령 완료. 로그를 확인해주세요.")
-
-    except subprocess.CalledProcessError as e:
-        telegram_bot.send(chat_id, f"❌ 명령어 실행 실패: {e}\n```\n{e.stdout}\n{e.stderr}\n```")
     except Exception as e:
-        telegram_bot.send(chat_id, f"❌ 업데이트 및 재시작 중 오류 발생: {e}")
+        telegram_bot.send(chat_id, f"❌ 업데이트 중 오류 발생: {e}")
 
 
 class TelegramBot:
