@@ -55,6 +55,14 @@ def load_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         return dict(default)
 
+def save_json(path: Path, data: Dict[str, Any]) -> None:
+    """JSON 데이터를 파일에 안전하게 저장합니다."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Error saving JSON to {path}: {e}", file=sys.stderr)
+
 
 def as_float(value: Any) -> Optional[float]:
     try:
@@ -124,14 +132,14 @@ def format_daily_summary(state: Dict[str, Any]) -> str:
     else:
         soc_text = "확인 부족"
     return (
-        f"오늘의 주행 요약 {daily.get("date") or "-"}\n"
+        f"오늘의 주행 요약 {daily.get('date') or '-'}\n"
         f"주행거리 {distance:.2f} km\n"
         f"주행시간 {seconds / 60:.0f}분\n"
         f"평균속도 {avg_speed:.1f} km/h\n"
         f"평균전비 {avg_eff:.2f} km/kWh\n"
         f"배터리 {soc_text}\n"
-        f"주행횟수 {len(daily.get("drive_sessions") or [])}회\n"
-        f"급가속 {int(daily.get("accel_count") or 0)}회, 급감속 {int(daily.get("decel_count") or 0)}회"
+        f"주행횟수 {len(daily.get('drive_sessions') or [])}회\n"
+        f"급가속 {int(daily.get('accel_count') or 0)}회, 급감속 {int(daily.get('decel_count') or 0)}회"
     )
 
 
@@ -142,11 +150,11 @@ def format_weekly_summary(state: Dict[str, Any]) -> str:
     energy = float(weekly.get("total_energy_kwh") or 0)
     avg_eff = distance / energy if energy > 0 else 0
     return (
-        f"주간 주행 요약 {weekly.get("week") or "-"}\n"
+        f"주간 주행 요약 {weekly.get('week') or '-'}\n"
         f"누적거리 {distance:.2f} km\n"
         f"누적시간 {seconds / 60:.0f}분\n"
         f"평균전비 {avg_eff:.2f} km/kWh\n"
-        f"주행횟수 {int(weekly.get("drive_count") or 0)}회"
+        f"주행횟수 {int(weekly.get('drive_count') or 0)}회"
     )
 
 
@@ -159,7 +167,7 @@ def format_status(state_file: Path) -> str:
     last_time = parse_dt(last.get("time"))
     if last_time:
         age_seconds = max(0, int((now_kst() - last_time.astimezone(KST)).total_seconds()))
-        last_text = f"{last_time.astimezone(KST).strftime("%H:%M:%S")} ({age_seconds}초 전)"
+        last_text = f"{last_time.astimezone(KST).strftime('%H:%M:%S')} ({age_seconds}초 전)"
     else:
         last_text = "기록 없음"
 
@@ -170,8 +178,8 @@ def format_status(state_file: Path) -> str:
     lines = [
         "LIGHT LOGGG 상태",
         f"프로세스: {running_text}",
-        f"차량: {last.get("vehicle_name") or "-"}",
-        f"Tesla 상태: {last.get("status") or "-"}",
+        f"차량: {last.get('vehicle_name') or '-'}",
+        f"Tesla 상태: {last.get('status') or '-'}",
         f"최근 폴링: {last_text}",
     ]
     if isinstance(next_seconds, (int, float)):
@@ -193,13 +201,18 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
         # 1. Curl update (로그인 없이 파일 직접 다운로드)
         telegram_bot.send(chat_id, "🔄 코드 업데이트 중 (curl)...")
         url = "https://raw.githubusercontent.com/doyaulchoi/doyaulchoi.github.io/main/light_loggg_telegram_bot.py"
-        result = subprocess.run(["curl", "-L", "-o", "light_loggg_telegram_bot.py", url], cwd=repo_path, capture_output=True, text=True )
+        result = subprocess.run(["curl", "-L", "-o", "light_loggg_telegram_bot.py", url], cwd=repo_path, capture_output=True, text=True  )
         
         if result.returncode != 0:
             telegram_bot.send(chat_id, f"❌ 업데이트 실패:\n{result.stderr}")
             return
 
-        # 2. 기존 폴링 프로세스 중지
+        # 2. 현재 오프셋 강제 저장 (무한 루프 방지 핵심)
+        st = load_json(telegram_bot.state_file, {})
+        st["last_offset"] = telegram_bot.offset + 1
+        save_json(telegram_bot.state_file, st)
+
+        # 3. 기존 폴링 프로세스 중지
         telegram_bot.send(chat_id, "🛑 기존 폴링 프로세스 중지 중...")
         if DEFAULT_PID_FILE.exists():
             try:
@@ -212,11 +225,9 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
             except Exception:
                 pass
 
-        # 3. 봇 자체를 재시작 (새로 받은 코드를 적용하기 위함)
+        # 4. 봇 자체를 재시작 (새로 받은 코드를 적용하기 위함)
         telegram_bot.send(chat_id, "✅ 업데이트 완료! 봇을 재시작하여 새 코드를 적용합니다...")
         
-        # 현재 실행 중인 파이썬 프로세스를 새 코드로 완전히 교체하여 재시작합니다.
-        # 이 과정에서 폴링 스크립트도 봇의 시작 로직에 따라 자동으로 다시 켜질 것입니다.
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     except Exception as e:
@@ -228,16 +239,17 @@ class TelegramBot:
         self.token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
         self.chat_id = os.getenv("TELEGRAM_CHAT_ID")
         self.state_file = state_file
-        self.offset = 0
+        # 시작할 때 저장된 오프셋 불러오기 (무한 루프 방지)
+        state = load_json(self.state_file, {})
+        self.offset = state.get("last_offset", 0)
         if not self.token:
             raise RuntimeError("TELEGRAM_BOT_TOKEN 또는 TELEGRAM_TOKEN 환경변수가 필요합니다.")
 
     def send(self, chat_id: str, text: str) -> None:
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        res = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=REQUEST_TIMEOUT)
+        res = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=REQUEST_TIMEOUT )
         if res.status_code >= 400:
             print(f"Telegram sendMessage HTTP {res.status_code}: {res.text[:200]}", file=sys.stderr)
-            # Do not raise RuntimeError here, as it would stop the bot
 
     def allowed(self, chat_id: str) -> bool:
         if self.chat_id:
@@ -263,18 +275,23 @@ class TelegramBot:
             self.send(chat_id, "알 수 없는 명령어입니다. 사용 가능한 명령어: /status, /daily, /weekly, /update")
 
     def run_forever(self) -> None:
-        print("LIGHT LOGGG Telegram command bot started", flush=True)
+        print(f"LIGHT LOGGG Telegram command bot started with offset: {self.offset}", flush=True)
         while True:
             try:
                 url = f"https://api.telegram.org/bot{self.token}/getUpdates"
-                res = requests.get(url, params={"offset": self.offset + 1, "timeout": 25}, timeout=35)
+                res = requests.get(url, params={"offset": self.offset + 1, "timeout": 25}, timeout=35 )
                 data = res.json()
                 if not data.get("ok"):
                     print(f"Telegram getUpdates error: {data}", file=sys.stderr, flush=True)
                     time.sleep(5)
                     continue
                 for update in data.get("result", []):
-                    self.offset = max(self.offset, int(update.get("update_id", 0)))
+                    # 메시지 읽자마자 오프셋 업데이트 및 저장 (무한 루프 방지 핵심)
+                    self.offset = int(update.get("update_id", 0))
+                    st = load_json(self.state_file, {})
+                    st["last_offset"] = self.offset
+                    save_json(self.state_file, st)
+                    
                     msg = update.get("message") or {}
                     text = msg.get("text") or ""
                     chat_id = str((msg.get("chat") or {}).get("id") or "")
