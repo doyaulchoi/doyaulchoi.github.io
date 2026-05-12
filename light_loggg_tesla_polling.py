@@ -193,7 +193,7 @@ class TeslaFleetClient:
     def refresh(self) -> None:
         if not self.refresh_token:
             raise RuntimeError(f"Tesla refresh_token이 없습니다. {self.token_file} 파일을 확인해야 합니다.")
-        if self.refresh_token in {"여기에 Tesla refresh_token 입력", "YOUR_REFRESH_TOKEN", ""} or len(str(self.refresh_token)) < 80:
+        if self.refresh_token in {"여기에 Tesla refresh_token 입력", "YOUR_REFRESH_TOKEN", ""} or len(str(self.refresh_token)) < 40:
             raise RuntimeError(
                 f"Tesla refresh_token이 아직 실제 값으로 입력되지 않았거나 형식이 너무 짧습니다. "
                 f"{self.token_file} 파일의 refresh_token 값을 실제 Tesla 사용자 refresh token으로 교체해야 합니다."
