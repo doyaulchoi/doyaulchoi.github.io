@@ -29,7 +29,8 @@ KST = timezone(timedelta(hours=9))
 DEFAULT_TOKEN_FILE = Path.home() / ".light_loggg_tesla_tokens.json"
 DEFAULT_STATE_FILE = Path.home() / ".light_loggg_state.json"
 DEFAULT_API_BASE = "https://fleet-api.prd.na.vn.cloud.tesla.com"
-AUTH_TOKEN_URL = "https://auth.tesla.com/oauth2/v3/token"
+DEFAULT_CLIENT_ID = "d1351a7e-42fd-4318-b6a2-c9d702af75c1"
+AUTH_TOKEN_URL = "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token"
 VEHICLE_DATA_ENDPOINTS = ";".join(
     [
         "charge_state",
@@ -174,21 +175,63 @@ class TelegramClient:
 
 
 class TeslaFleetClient:
-    def __init__(self, token_file: Path, api_base: str = DEFAULT_API_BASE) -> None:
+    def __init__(self, token_file: Path, state_file: Path, api_base: str = DEFAULT_API_BASE) -> None:
         self.token_file = token_file
+        self.state_file = state_file
         self.api_base = api_base.rstrip("/")
         self.session = requests.Session()
         self.tokens = load_json(token_file, {})
+        self.state = load_json(state_file, {})
         self.access_token = self.tokens.get("access_token") or self.tokens.get("token")
+        self.access_token_expires_at = float(self.tokens.get("access_token_expires_at") or 0)
+        state_access_token = self.state.get("access_token")
+        state_expires_at = float(self.state.get("access_token_expires_at") or 0)
+        if state_access_token and state_expires_at > self.access_token_expires_at:
+            self.access_token = state_access_token
+            self.access_token_expires_at = state_expires_at
         self.refresh_token = self.tokens.get("refresh_token")
-        self.client_id = os.getenv("TESLA_AUTH_CLIENT_ID", "ownerapi")
+        self.client_id = os.getenv("TESLA_CLIENT_ID") or os.getenv("TESLA_AUTH_CLIENT_ID") or DEFAULT_CLIENT_ID
+        self.client_secret = os.getenv("TESLA_CLIENT_SECRET", "")
+        self.scope = os.getenv("TESLA_SCOPE", "openid offline_access user_data vehicle_device_data")
+
+    def access_token_valid(self) -> bool:
+        return bool(self.access_token and self.access_token_expires_at > time.time() + 120)
 
     def save_tokens(self, body: Dict[str, Any]) -> None:
-        self.tokens.update(body)
-        self.access_token = body.get("access_token", self.access_token)
-        self.refresh_token = body.get("refresh_token", self.refresh_token)
-        self.tokens["saved_at"] = now_kst().isoformat()
-        atomic_write_json(self.token_file, self.tokens)
+        access_token = body.get("access_token")
+        refresh_token = body.get("refresh_token")
+        if isinstance(access_token, str) and access_token:
+            self.access_token = access_token
+        if isinstance(refresh_token, str) and refresh_token:
+            self.refresh_token = refresh_token
+        expires_in = int(body.get("expires_in") or 0)
+        if expires_in > 0:
+            self.access_token_expires_at = time.time() + max(60, expires_in - 120)
+        saved_at = now_kst().isoformat()
+
+        if not self.refresh_token:
+            raise RuntimeError("Tesla token refresh 응답에 refresh_token이 없어 토큰 회전을 저장할 수 없습니다.")
+        token_payload = {"refresh_token": self.refresh_token, "saved_at": saved_at}
+        atomic_write_json(self.token_file, token_payload)
+        try:
+            os.chmod(self.token_file, 0o600)
+        except OSError:
+            pass
+
+        state_payload = load_json(self.state_file, {})
+        if self.access_token:
+            state_payload["access_token"] = self.access_token
+        if self.access_token_expires_at:
+            state_payload["access_token_expires_at"] = self.access_token_expires_at
+        state_payload["last_token_refresh_at"] = time.time()
+        state_payload["token_saved_at"] = saved_at
+        atomic_write_json(self.state_file, state_payload)
+        try:
+            os.chmod(self.state_file, 0o600)
+        except OSError:
+            pass
+        self.tokens = token_payload
+        self.state = state_payload
 
     def refresh(self) -> None:
         if not self.refresh_token:
@@ -200,11 +243,18 @@ class TeslaFleetClient:
             )
         data = {
             "grant_type": "refresh_token",
-            "scope": "openid email offline_access",
+            "scope": self.scope,
             "client_id": self.client_id,
             "refresh_token": self.refresh_token,
         }
-        res = self.session.post(AUTH_TOKEN_URL, json=data, timeout=REQUEST_TIMEOUT)
+        if self.client_secret:
+            data["client_secret"] = self.client_secret
+        res = self.session.post(
+            AUTH_TOKEN_URL,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=REQUEST_TIMEOUT,
+        )
         if res.status_code != 200:
             extra = ""
             try:
@@ -217,7 +267,7 @@ class TeslaFleetClient:
         self.save_tokens(res.json())
 
     def request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None, retry: bool = True) -> Dict[str, Any]:
-        if not self.access_token:
+        if not self.access_token_valid():
             self.refresh()
         url = f"{self.api_base}{path}"
         headers = {"Authorization": f"Bearer {self.access_token}", "User-Agent": "LIGHT-LOGGG/teslamate-style-poller"}
@@ -326,6 +376,10 @@ class LightLogggPoller:
     def save_state(self) -> None:
         self.state["last_summary_date"] = self.last_summary_date
         self.state["last_weekly_summary_iso"] = self.last_weekly_summary_iso
+        current = load_json(self.state_file, {})
+        for key in ("access_token", "access_token_expires_at", "last_token_refresh_at", "token_saved_at"):
+            if key in current:
+                self.state[key] = current[key]
         atomic_write_json(self.state_file, self.state)
 
     def identify_vehicle(self) -> None:
@@ -656,7 +710,7 @@ def main() -> int:
         load_dotenv(Path(".env"))
         load_dotenv(Path.home() / ".light_loggg.env")
     api_base = args.api_base or os.getenv("TESLA_API_BASE", DEFAULT_API_BASE)
-    client = TeslaFleetClient(Path(args.token_file).expanduser(), api_base)
+    client = TeslaFleetClient(Path(args.token_file).expanduser(), Path(args.state_file).expanduser(), api_base)
     telegram = TelegramClient()
     target_vin = args.vin or os.getenv("TESLA_VIN")
     poller = LightLogggPoller(client, telegram, Path(args.state_file).expanduser(), target_vin)
