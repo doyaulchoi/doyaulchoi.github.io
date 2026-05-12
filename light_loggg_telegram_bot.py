@@ -6,6 +6,7 @@ import sys
 import time
 import signal
 import shutil
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -82,7 +83,6 @@ def format_status(state_file: Path) -> str:
         f"최근 폴링: {last_text}",
     ]
     
-    # 충전 정보 표시
     c_state = last.get("charging_state")
     if c_state and c_state != "Disconnected":
         pwr = as_float(last.get("charger_power"))
@@ -100,17 +100,37 @@ def format_status(state_file: Path) -> str:
 def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
     repo_path = Path(__file__).parent
     try:
-        telegram_bot.send(chat_id, "🔄 코드 업데이트 중 (curl)...")
-        url = "https://raw.githubusercontent.com/doyaulchoi/doyaulchoi.github.io/main/light_loggg_telegram_bot.py"
-        subprocess.run(["curl", "-L", "-o", "light_loggg_telegram_bot.py", url], cwd=repo_path )
+        telegram_bot.send(chat_id, "🔄 전체 코드 업데이트 중 (ZIP)...")
         
-        # 오프셋 저장 (무한 루프 방지)
+        # 1. ZIP 다운로드
+        zip_url = "https://github.com/doyaulchoi/doyaulchoi.github.io/archive/refs/heads/main.zip"
+        zip_path = repo_path / "repo.zip"
+        subprocess.run(["curl", "-L", "-o", str(zip_path ), zip_url], check=True)
+        
+        # 2. 압축 해제
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(repo_path)
+        
+        # 3. 파일 교체 (GitHub ZIP은 폴더 안에 담겨 있음)
+        extracted_dir = repo_path / "doyaulchoi.github.io-main"
+        if extracted_dir.exists():
+            for item in extracted_dir.iterdir():
+                dest = repo_path / item.name
+                if item.is_dir():
+                    if dest.exists(): shutil.rmtree(dest)
+                    shutil.copytree(item, dest)
+                else:
+                    shutil.copy2(item, dest)
+            shutil.rmtree(extracted_dir)
+        
+        zip_path.unlink(missing_ok=True)
+
+        # 4. 오프셋 저장 (무한 루프 방지)
         st = load_json(telegram_bot.state_file, {})
         st["last_offset"] = telegram_bot.offset + 1
         save_json(telegram_bot.state_file, st)
 
-        # 재시작
-        telegram_bot.send(chat_id, "✅ 업데이트 완료! 재시작합니다...")
+        telegram_bot.send(chat_id, "✅ 전체 업데이트 완료! 재시작합니다...")
         os.execv(sys.executable, [sys.executable] + sys.argv)
     except Exception as e: telegram_bot.send(chat_id, f"❌ 오류: {e}")
 
