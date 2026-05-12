@@ -40,14 +40,13 @@ def check_remote_commands():
                     text = message.get("text", "")
                     sender_id = str(message.get("from", {}).get("id", ""))
                     
-                    # 보안 확인: 등록된 사용자만 명령 가능
+                    # 보안 확인: 등록된 사용자(엔지니어님)로부터 온 명령만 실행
+                    # (이후 Manus가 직접 신호를 보낼 수 있도록 로직 확장 가능)
                     if sender_id == CHAT_ID:
                         if text == "/update":
-                            send_telegram_message("🔄 **원격 업데이트를 시작합니다...**\nGitHub에서 최신 코드를 불러옵니다.")
-                            # 업데이트 스크립트 실행 (부모 프로세스에게 시그널을 보내거나 파일을 생성하여 알림)
+                            send_telegram_message("🔄 **원격 업데이트를 시작합니다...**")
                             with open(os.path.expanduser("~/update_trigger"), "w") as f:
                                 f.write("update")
-                            # 현재 프로세스 종료 (setup 스크립트가 재시작하도록 유도)
                             os.kill(os.getppid(), signal.SIGTERM)
                             sys.exit(0)
                         elif text == "/status":
@@ -84,15 +83,15 @@ def process_telemetry_data(data):
             send_telegram_message(f"📉 **전비 경고!**\n최근 {WINDOW_SIZE_MINUTES}분 평균 전비가 **{eff} km/kWh**입니다.")
 
 if __name__ == "__main__":
-    # 원격 명령 감시 스레드 시작
     cmd_thread = threading.Thread(target=check_remote_commands, daemon=True)
     cmd_thread.start()
     
-    print("Tesla Telemetry Handler V3 (Remote Control Enabled) Started...")
-    send_telegram_message("🚀 **두삼이 관제 시스템 가동 시작**\n(원격 제어 활성화: /update, /status)")
+    print("Tesla Telemetry Handler V4 (Remote Control Ready) Started...")
+    send_telegram_message("🚀 **두삼이 관제 시스템 가동 시작**\n(원격 제어 준비 완료)")
     
     for line in sys.stdin:
         try:
+            # Telemetry 서버가 뱉는 로그를 한 줄씩 읽어 처리
             data = json.loads(line)
             process_telemetry_data(data)
         except:
