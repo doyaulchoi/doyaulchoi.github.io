@@ -32,7 +32,11 @@ daily_stats = {
     "efficiencies": [],
     "power_readings": [],
     "last_location": None,
-    "drive_sessions": [],  # 각 주행 세션의 정보
+    "drive_sessions": [],
+    "acceleration_events": [],  # 급가속 이벤트
+    "deceleration_events": [],  # 급감속 이벤트
+    "charging_sessions": [],  # 충전 세션
+    "soc_history": [],  # SOC 변화 기록
     "date": datetime.now().date()
 }
 
@@ -43,7 +47,12 @@ weekly_stats = {
         "avg_speed": 0,
         "avg_efficiency": 0,
         "energy_used": 0,
-        "drive_count": 0
+        "drive_count": 0,
+        "rapid_accel_count": 0,
+        "rapid_decel_count": 0,
+        "charging_count": 0,
+        "avg_charge_speed": 0,
+        "abnormal_soc_time": 0  # 배터리 20% 이하 또는 70% 초과 시간
     }),
     "week_start": None
 }
@@ -55,8 +64,21 @@ current_session = {
     "session_start_odometer": None,
     "session_start_soc": None,
     "session_speeds": [],
-    "session_efficiencies": []
+    "session_efficiencies": [],
+    "last_speed": 0,
+    "last_soc": None
 }
+
+current_charging = {
+    "charging": False,
+    "charge_start_time": None,
+    "charge_start_soc": None,
+    "charge_end_soc": None
+}
+
+# 급가감속 감지 임계값
+RAPID_ACCEL_THRESHOLD = 2.0  # m/s² (약 7.2 km/h/s)
+RAPID_DECEL_THRESHOLD = -2.0  # m/s²
 
 def send_message(text):
     """텔레그램 메시지 전송"""
@@ -111,7 +133,6 @@ def calculate_efficiency(points):
         power = abs(p.get("power", 0))
         
         if speed > 0:
-            # 1초 단위 거리 계산 (속도는 km/h)
             distance_km = speed / 3600
             total_distance += distance_km
             total_energy += power / 1000  # W to kW
@@ -121,22 +142,38 @@ def calculate_efficiency(points):
     
     return round(total_distance / total_energy, 2)
 
+def detect_rapid_accel_decel(current_speed, last_speed, time_delta_seconds):
+    """급가감속 감지"""
+    if time_delta_seconds == 0 or last_speed is None:
+        return None
+    
+    # mph를 m/s로 변환
+    current_speed_ms = current_speed * 0.44704
+    last_speed_ms = last_speed * 0.44704
+    
+    acceleration = (current_speed_ms - last_speed_ms) / time_delta_seconds
+    
+    if acceleration > RAPID_ACCEL_THRESHOLD:
+        return "accel"
+    elif acceleration < RAPID_DECEL_THRESHOLD:
+        return "decel"
+    
+    return None
+
 def is_home(location):
-    """집 위치 판단 (대략적인 위도/경도)"""
+    """집 위치 판단"""
     if not location:
         return False
     
-    # 집 위치 (예시 - 실제로는 엔지니어님의 집 좌표로 설정 필요)
-    HOME_LAT = 37.4979  # 대략적인 좌표
+    HOME_LAT = 37.4979
     HOME_LON = 127.0276
-    RADIUS_KM = 0.5  # 500m 반경
+    RADIUS_KM = 0.5
     
     lat = location.get("latitude", 0)
     lon = location.get("longitude", 0)
     
-    # 간단한 거리 계산 (대략적)
     distance = ((lat - HOME_LAT) ** 2 + (lon - HOME_LON) ** 2) ** 0.5
-    return distance < (RADIUS_KM / 111)  # 1도 ≈ 111km
+    return distance < (RADIUS_KM / 111)
 
 def format_daily_summary():
     """일일 주행 요약 포맷팅"""
@@ -171,6 +208,10 @@ def format_weekly_summary():
     """주간 주행 요약 포맷팅"""
     total_distance = sum(day["distance"] for day in weekly_stats["days"].values())
     total_drives = sum(day["drive_count"] for day in weekly_stats["days"].values())
+    total_rapid_accel = sum(day["rapid_accel_count"] for day in weekly_stats["days"].values())
+    total_rapid_decel = sum(day["rapid_decel_count"] for day in weekly_stats["days"].values())
+    total_charging = sum(day["charging_count"] for day in weekly_stats["days"].values())
+    total_abnormal_soc_time = sum(day["abnormal_soc_time"] for day in weekly_stats["days"].values())
     
     if total_distance == 0:
         return "📊 이번 주 주행 기록 없음"
@@ -180,12 +221,39 @@ def format_weekly_summary():
     if total_energy > 0:
         avg_efficiency_weekly = total_distance / total_energy
     
+    # 급가감속 비율 계산
+    total_accel_decel = total_rapid_accel + total_rapid_decel
+    accel_ratio = (total_rapid_accel / total_accel_decel * 100) if total_accel_decel > 0 else 0
+    decel_ratio = (total_rapid_decel / total_accel_decel * 100) if total_accel_decel > 0 else 0
+    
+    # 평균 충전 속도
+    avg_charge_speed = 0
+    if total_charging > 0:
+        total_charge_speed = sum(day["avg_charge_speed"] for day in weekly_stats["days"].values())
+        avg_charge_speed = total_charge_speed / total_charging
+    
+    # 배터리 이상 상태 비율
+    total_driving_time = sum(day["distance"] / (day["avg_speed"] if day["avg_speed"] > 0 else 50) * 3600 
+                            for day in weekly_stats["days"].values())
+    abnormal_soc_ratio = (total_abnormal_soc_time / total_driving_time * 100) if total_driving_time > 0 else 0
+    
     summary = f"""📈 **주간 주행 요약**
 
 🚗 총 주행거리: {total_distance:.1f} km
 ⏱️ 주행 횟수: {total_drives}회
 ⚡ 평균전비: {avg_efficiency_weekly:.2f} km/kWh
 🔋 총 에너지 소비: {total_energy:.1f} kWh
+
+🚀 급가감속 분석:
+  • 급가속: {total_rapid_accel}회 ({accel_ratio:.1f}%)
+  • 급감속: {total_rapid_decel}회 ({decel_ratio:.1f}%)
+
+⚡ 충전 정보:
+  • 충전 횟수: {total_charging}회
+  • 평균 충전속도: {avg_charge_speed:.1f} kW
+
+🔋 배터리 상태:
+  • 20% 이하 또는 70% 초과 지속 비율: {abnormal_soc_ratio:.1f}%
 
 📅 기간: {weekly_stats['week_start'].strftime('%Y-%m-%d')} ~ {datetime.now().strftime('%Y-%m-%d')}"""
     
@@ -214,7 +282,7 @@ def check_summary_triggers():
             time.sleep(60)
         
         # 매주 금요일 21:00 체크
-        if now.weekday() == 4 and now.hour == 21 and now.minute == 0:  # 4 = Friday
+        if now.weekday() == 4 and now.hour == 21 and now.minute == 0:
             send_weekly_summary()
             time.sleep(60)
         
@@ -245,6 +313,10 @@ def reset_daily_stats():
         "power_readings": [],
         "last_location": None,
         "drive_sessions": [],
+        "acceleration_events": [],
+        "deceleration_events": [],
+        "charging_sessions": [],
+        "soc_history": [],
         "date": datetime.now().date()
     }
 
@@ -257,14 +329,19 @@ def reset_weekly_stats():
             "avg_speed": 0,
             "avg_efficiency": 0,
             "energy_used": 0,
-            "drive_count": 0
+            "drive_count": 0,
+            "rapid_accel_count": 0,
+            "rapid_decel_count": 0,
+            "charging_count": 0,
+            "avg_charge_speed": 0,
+            "abnormal_soc_time": 0
         }),
         "week_start": datetime.now()
     }
 
 def process_data(data):
     """테슬라 Telemetry 데이터 처리"""
-    global last_alert_time, current_session, daily_stats
+    global last_alert_time, current_session, current_charging, daily_stats
     
     current_time = datetime.now()
     data["ts"] = current_time
@@ -279,6 +356,35 @@ def process_data(data):
     odometer = data.get("odometer", 0)
     location = data.get("location", {})
     power = data.get("power", 0)
+    
+    # SOC 기록
+    daily_stats["soc_history"].append({"time": current_time, "soc": soc})
+    
+    # 배터리 이상 상태 감지 (20% 이하 또는 70% 초과)
+    if soc <= 20 or soc >= 70:
+        daily_stats["abnormal_soc_time"] = daily_stats.get("abnormal_soc_time", 0) + 1
+    
+    # 충전 감지 (power > 0이고 speed == 0)
+    is_charging = power > 0 and speed == 0
+    
+    if is_charging and not current_charging["charging"]:
+        current_charging["charging"] = True
+        current_charging["charge_start_time"] = current_time
+        current_charging["charge_start_soc"] = soc
+    
+    elif not is_charging and current_charging["charging"]:
+        current_charging["charging"] = False
+        if current_charging["charge_start_time"]:
+            charge_duration = (current_time - current_charging["charge_start_time"]).total_seconds() / 3600
+            charge_amount = soc - current_charging["charge_start_soc"]
+            
+            if charge_duration > 0 and charge_amount > 0:
+                charge_speed = charge_amount / charge_duration
+                daily_stats["charging_sessions"].append({
+                    "duration": charge_duration,
+                    "amount": charge_amount,
+                    "speed": charge_speed
+                })
     
     # 주행 중 감지
     is_driving = speed > 1
@@ -301,6 +407,18 @@ def process_data(data):
         daily_stats["speeds"].append(speed)
         daily_stats["power_readings"].append(power)
         daily_stats["last_location"] = location
+        
+        # 급가감속 감지
+        if current_session["last_speed"] is not None:
+            time_delta = 1  # 1초 단위로 가정
+            accel_type = detect_rapid_accel_decel(speed, current_session["last_speed"], time_delta)
+            
+            if accel_type == "accel":
+                daily_stats["acceleration_events"].append(current_time)
+            elif accel_type == "decel":
+                daily_stats["deceleration_events"].append(current_time)
+        
+        current_session["last_speed"] = speed
         
         # 전비 계산 및 경고
         eff = calculate_efficiency(list(data_window))
@@ -333,7 +451,9 @@ def process_data(data):
                 "distance": session_distance,
                 "duration": session_duration,
                 "soc_change": session_soc_change,
-                "avg_speed": sum(current_session["session_speeds"]) / len(current_session["session_speeds"]) if current_session["session_speeds"] else 0
+                "avg_speed": sum(current_session["session_speeds"]) / len(current_session["session_speeds"]) if current_session["session_speeds"] else 0,
+                "accel_count": len(daily_stats["acceleration_events"]),
+                "decel_count": len(daily_stats["deceleration_events"])
             }
             daily_stats["drive_sessions"].append(session_info)
         
@@ -348,7 +468,9 @@ def process_data(data):
             "session_start_odometer": None,
             "session_start_soc": None,
             "session_speeds": [],
-            "session_efficiencies": []
+            "session_efficiencies": [],
+            "last_speed": 0,
+            "last_soc": None
         }
 
 if __name__ == "__main__":
@@ -360,7 +482,7 @@ if __name__ == "__main__":
     summary_thread = threading.Thread(target=check_summary_triggers, daemon=True)
     summary_thread.start()
     
-    send_message("🚀 두삼이 관제 시스템 v2 가동 시작\n- 일일/주간 주행 요약 기능 추가")
+    send_message("🚀 두삼이 관제 시스템 최종 버전 가동 시작\n- 급가감속, 충전속도, 배터리 상태 모니터링 추가")
     
     # 표준 입력에서 데이터 읽기
     for line in sys.stdin:
