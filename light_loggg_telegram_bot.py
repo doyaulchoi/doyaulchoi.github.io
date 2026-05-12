@@ -1,167 +1,125 @@
-#!/usr/bin/env python3
-import json
 import os
-import subprocess
-import sys
-import time
-import signal
-import shutil
-import zipfile
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Dict, Optional
+import json
 import requests
+import subprocess
+import time
+import logging
 
-KST = timezone(timedelta(hours=9))
-REQUEST_TIMEOUT = int(os.getenv("LIGHT_LOGGG_REQUEST_TIMEOUT", "25"))
-DEFAULT_STATE_FILE = Path.home() / ".light_loggg_state.json"
-DEFAULT_PID_FILE = Path.home() / "light_loggg_tesla" / "polling.pid"
-DEFAULT_LOG_FILE = Path.home() / "light_loggg_tesla" / "logs" / "polling.log"
-POLLING_SCRIPT_PATH = Path(__file__).parent / "light_loggg_tesla_polling.py"
+# 설정 로드
+CONFIG_PATH = os.path.expanduser("~/.light_loggg_config.json")
+STATE_PATH = os.path.expanduser("~/.light_loggg_state.json")
 
-def load_dotenv(path: Path = Path(".env")) -> None:
-    if not path.exists(): return
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line: continue
-        key, value = line.split("=", 1)
-        os.environ[key.strip()] = value.strip().strip("\"").strip("\'")
-
-def now_kst() -> datetime: return datetime.now(KST)
-
-def load_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
-    if not path.exists(): return dict(default)
-    try: return json.loads(path.read_text(encoding="utf-8"))
-    except Exception: return dict(default)
-
-def save_json(path: Path, data: Dict[str, Any]) -> None:
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e: print(f"Error saving JSON: {e}", file=sys.stderr)
-
-def as_float(value: Any) -> Optional[float]:
-    try: return float(value) if value is not None and value != "" else None
-    except: return None
-
-def parse_dt(value: Any) -> Optional[datetime]:
-    if not isinstance(value, str) or not value: return None
-    try: return datetime.fromisoformat(value)
-    except: return None
-
-def process_alive(pid_file: Path = DEFAULT_PID_FILE) -> bool:
-    if not pid_file.exists(): return False
-    try:
-        pid = int(pid_file.read_text(encoding="utf-8").strip())
-        os.kill(pid, 0)
-        return True
-    except: return False
-
-def tail_log(log_file: Path = DEFAULT_LOG_FILE, lines: int = 3) -> str:
-    if not log_file.exists(): return "로그 없음"
-    try:
-        res = subprocess.run(["tail", "-n", str(lines), str(log_file)], capture_output=True, text=True)
-        return res.stdout.strip() or "최근 로그 없음"
-    except: return "로그 확인 실패"
-
-def format_status(state_file: Path) -> str:
-    state = load_json(state_file, {})
-    last = state.get("last_poll") or {}
-    running = process_alive()
-    
-    last_time = parse_dt(last.get("time"))
-    if last_time:
-        age = max(0, int((now_kst() - last_time.astimezone(KST)).total_seconds()))
-        last_text = f"{last_time.astimezone(KST).strftime('%H:%M:%S')} ({age}초 전)"
-    else: last_text = "기록 없음"
-
-    lines = [
-        "LIGHT LOGGG 상태",
-        f"프로세스: {'✅ 실행 중' if running else '❌ 중지됨'}",
-        f"차량: {last.get('vehicle_name') or '-'}",
-        f"Tesla 상태: {last.get('status') or '-'}",
-        f"최근 폴링: {last_text}",
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.expanduser("~/light_loggg_bot.log")),
+        logging.StreamHandler()
     ]
+)
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        return None
+    with open(CONFIG_PATH, 'r') as f:
+        return json.load(f)
+
+def get_offset():
+    if os.path.exists(STATE_PATH):
+        with open(STATE_PATH, 'r') as f:
+            state = json.load(f)
+            return state.get("bot_offset", 0)
+    return 0
+
+def save_offset(offset):
+    state = {}
+    if os.path.exists(STATE_PATH):
+        with open(STATE_PATH, 'r') as f:
+            state = json.load(f)
+    state["bot_offset"] = offset
+    with open(STATE_PATH, 'w') as f:
+        json.dump(state, f)
+
+def send_message(token, chat_id, text):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    requests.post(url, json={"chat_id": chat_id, "text": text})
+
+def handle_update(config):
+    repo_url = "https://raw.githubusercontent.com/doyaulchoi/doyaulchoi.github.io/main/light_loggg_tesla"
+    files = ["light_loggg_telegram_bot.py", "light_loggg_tesla_polling.py"]
     
-    c_state = last.get("charging_state")
-    if c_state and c_state != "Disconnected":
-        pwr = as_float(last.get("charger_power"))
-        added = as_float(last.get("charge_energy_added"))
-        lines.append(f"⚡ 충전 상태: {c_state}")
-        if pwr is not None: lines.append(f"🔌 충전 속도: {pwr:.1f} kW")
-        if added is not None: lines.append(f"🔋 충전량: {added:.1f} kWh 추가됨")
-
-    battery = as_float(last.get("battery_level"))
-    if battery is not None: lines.append(f"배터리: {battery:.0f}%")
+    results = []
+    for file in files:
+        cmd = f"curl -L {repo_url}/{file} -o ~/light_loggg_tesla/{file}"
+        process = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if process.returncode == 0:
+            results.append(f"✅ {file} 업데이트 성공")
+        else:
+            results.append(f"❌ {file} 업데이트 실패: {process.stderr}")
     
-    lines.append(f"최근 로그:\n{tail_log()}")
-    return "\n".join(lines)
+    msg = "🔄 시스템 업데이트 결과:\n" + "\n".join(results)
+    msg += "\n\n시스템을 재시작합니다..."
+    send_message(config['telegram_token'], config['chat_id'], msg)
+    
+    # 프로세스 재시작 로직
+    # 1. 폴링 프로세스 종료 및 재시작
+    subprocess.run("pkill -f light_loggg_tesla_polling.py", shell=True)
+    subprocess.run("nohup python3 ~/light_loggg_tesla/light_loggg_tesla_polling.py > ~/light_loggg_polling.log 2>&1 &", shell=True)
+    
+    # 2. 봇 프로세스 재시작 (자기 자신을 다시 실행하고 현재 프로세스 종료)
+    os.execv('/usr/bin/python3', ['python3', os.path.expanduser('~/light_loggg_tesla/light_loggg_telegram_bot.py')])
 
-def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
-    repo_path = Path(__file__).parent
-    try:
-        telegram_bot.send(chat_id, "🔄 전체 코드 업데이트 중 (ZIP)...")
-        
-        # 1. ZIP 다운로드
-        zip_url = "https://github.com/doyaulchoi/doyaulchoi.github.io/archive/refs/heads/main.zip"
-        zip_path = repo_path / "repo.zip"
-        subprocess.run(["curl", "-L", "-o", str(zip_path ), zip_url], check=True)
-        
-        # 2. 압축 해제
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(repo_path)
-        
-        # 3. 파일 교체 (GitHub ZIP은 폴더 안에 담겨 있음)
-        extracted_dir = repo_path / "doyaulchoi.github.io-main"
-        if extracted_dir.exists():
-            for item in extracted_dir.iterdir():
-                dest = repo_path / item.name
-                if item.is_dir():
-                    if dest.exists(): shutil.rmtree(dest)
-                    shutil.copytree(item, dest)
-                else:
-                    shutil.copy2(item, dest)
-            shutil.rmtree(extracted_dir)
-        
-        zip_path.unlink(missing_ok=True)
+def main():
+    config = load_config()
+    if not config:
+        logging.error("Config not found")
+        return
 
-        # 4. 오프셋 저장 (무한 루프 방지)
-        st = load_json(telegram_bot.state_file, {})
-        st["last_offset"] = telegram_bot.offset + 1
-        save_json(telegram_bot.state_file, st)
+    token = config['telegram_token']
+    offset = get_offset()
+    
+    logging.info("Telegram Bot Started")
+    
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout=30"
+            response = requests.get(url).json()
+            
+            if response.get("ok"):
+                for update in response.get("result", []):
+                    offset = update["update_id"] + 1
+                    save_offset(offset)
+                    
+                    message = update.get("message", {})
+                    text = message.get("text", "")
+                    chat_id = message.get("chat", {}).get("id")
+                    
+                    if str(chat_id) != str(config['chat_id']):
+                        continue
 
-        telegram_bot.send(chat_id, "✅ 전체 업데이트 완료! 재시작합니다...")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-    except Exception as e: telegram_bot.send(chat_id, f"❌ 오류: {e}")
-
-class TelegramBot:
-    def __init__(self, state_file: Path):
-        load_dotenv(Path.home() / ".light_loggg.env")
-        self.token = os.getenv("TELEGRAM_BOT_TOKEN")
-        self.chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        self.state_file = state_file
-        self.offset = load_json(self.state_file, {}).get("last_offset", 0)
-
-    def send(self, chat_id: str, text: str):
-        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=REQUEST_TIMEOUT )
-
-    def handle(self, chat_id: str, text: str):
-        cmd = (text or "").strip().lower()
-        if "/status" in cmd: self.send(chat_id, format_status(self.state_file))
-        elif "/update" in cmd: update_and_restart_polling(self, chat_id)
-
-    def run_forever(self):
-        while True:
-            try:
-                url = f"https://api.telegram.org/bot{self.token}/getUpdates"
-                res = requests.get(url, params={"offset": self.offset + 1, "timeout": 25}, timeout=35 ).json()
-                for up in res.get("result", []):
-                    self.offset = int(up.get("update_id", 0))
-                    st = load_json(self.state_file, {}); st["last_offset"] = self.offset; save_json(self.state_file, st)
-                    msg = up.get("message") or {}; self.handle(str(msg.get("chat", {}).get("id")), msg.get("text"))
-            except: time.sleep(5)
+                    if text == "/status":
+                        # 폴링 스크립트가 저장한 최신 상태 읽기
+                        if os.path.exists(STATE_PATH):
+                            with open(STATE_PATH, 'r') as f:
+                                state = json.load(f)
+                            status_msg = f"📊 현재 상태: {state.get('last_charging_state', '알 수 없음')}"
+                        else:
+                            status_msg = "📊 상태 정보를 불러올 수 없습니다."
+                        send_message(token, chat_id, status_msg)
+                    
+                    elif text == "/update":
+                        handle_update(config)
+                    
+                    elif text.startswith("/"):
+                        help_msg = ("❓ 알 수 없는 명령어입니다.\n\n"
+                                    "사용 가능한 명령어:\n"
+                                    "/status - 현재 차량 상태 확인\n"
+                                    "/update - 시스템 최신 버전 업데이트")
+                        send_message(token, chat_id, help_msg)
+                        
+        except Exception as e:
+            logging.error(f"Error in bot loop: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
-    state_file = DEFAULT_STATE_FILE.expanduser()
-    TelegramBot(state_file).run_forever()
+    main()
