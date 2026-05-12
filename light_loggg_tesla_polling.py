@@ -193,6 +193,11 @@ class TeslaFleetClient:
     def refresh(self) -> None:
         if not self.refresh_token:
             raise RuntimeError(f"Tesla refresh_token이 없습니다. {self.token_file} 파일을 확인해야 합니다.")
+        if self.refresh_token in {"여기에 Tesla refresh_token 입력", "YOUR_REFRESH_TOKEN", ""} or len(str(self.refresh_token)) < 80:
+            raise RuntimeError(
+                f"Tesla refresh_token이 아직 실제 값으로 입력되지 않았거나 형식이 너무 짧습니다. "
+                f"{self.token_file} 파일의 refresh_token 값을 실제 Tesla 사용자 refresh token으로 교체해야 합니다."
+            )
         data = {
             "grant_type": "refresh_token",
             "scope": "openid email offline_access",
@@ -201,7 +206,14 @@ class TeslaFleetClient:
         }
         res = self.session.post(AUTH_TOKEN_URL, json=data, timeout=REQUEST_TIMEOUT)
         if res.status_code != 200:
-            raise RuntimeError(f"Tesla token refresh failed: HTTP {res.status_code} {res.text[:300]}")
+            extra = ""
+            try:
+                err = res.json()
+                if err.get("error_description") == "The refresh_token is invalid":
+                    extra = " 입력된 refresh_token이 만료됐거나 실제 사용자 refresh token이 아닙니다. 새로 발급해 교체해야 합니다."
+            except Exception:
+                pass
+            raise RuntimeError(f"Tesla token refresh failed: HTTP {res.status_code} {res.text[:300]}{extra}")
         self.save_tokens(res.json())
 
     def request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None, retry: bool = True) -> Dict[str, Any]:
