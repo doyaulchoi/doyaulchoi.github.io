@@ -225,9 +225,20 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
             except Exception:
                 pass
 
-        # 4. 봇 자체를 재시작 (새로 받은 코드를 적용하기 위함)
+        # 4. 새 폴링 프로세스 시작 (로깅이 멈추지 않도록)
+        telegram_bot.send(chat_id, "🚀 새 폴링 프로세스 시작 중...")
+        DEFAULT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(DEFAULT_LOG_FILE, "a") as log_output:
+            subprocess.Popen(
+                [sys.executable, str(POLLING_SCRIPT_PATH)],
+                cwd=repo_path,
+                stdout=log_output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True
+            )
+
+        # 5. 봇 자체를 재시작 (새로 받은 코드를 적용하기 위함)
         telegram_bot.send(chat_id, "✅ 업데이트 완료! 봇을 재시작하여 새 코드를 적용합니다...")
-        
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     except Exception as e:
