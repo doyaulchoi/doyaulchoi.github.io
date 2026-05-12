@@ -1,98 +1,106 @@
+#!/usr/bin/env python3
 import sys
 import json
 import requests
 import os
 import signal
-import subprocess
+import time
 from datetime import datetime, timedelta
 from collections import deque
 import threading
-import time
 
 # 텔레그램 설정
 TELEGRAM_TOKEN = "8776022575:AAFvPkYGd0rLMh15CqzVsiKkY69YniOgvM0"
 CHAT_ID = "8792879646"
 
-# 전비 모니터링 설정
+# 전비 모니터링
 WINDOW_SIZE_MINUTES = 3
 THRESHOLD_EFFICIENCY = 4.5
 data_window = deque()
+last_alert_time = 0
 
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
+def send_message(text):
+    """텔레그램 메시지 전송 (간단하고 견고함)"""
     try:
-        requests.post(url, json=payload)
-    except Exception as e:
-        print(f"Failed to send telegram message: {e}")
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=5)
+    except:
+        pass
 
-def check_remote_commands():
-    """텔레그램 메시지를 확인하여 원격 명령 처리"""
-    last_update_id = 0
+def check_commands():
+    """텔레그램 명령 확인"""
+    last_id = 0
     while True:
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={last_update_id + 1}"
-            res = requests.get(url, timeout=10).json()
-            if res.get("ok"):
-                for update in res.get("result", []):
-                    last_update_id = update["update_id"]
-                    message = update.get("message", {})
-                    text = message.get("text", "")
-                    sender_id = str(message.get("from", {}).get("id", ""))
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+            res = requests.get(url, params={"offset": last_id + 1}, timeout=10)
+            data = res.json()
+            
+            if data.get("ok"):
+                for update in data.get("result", []):
+                    last_id = update["update_id"]
+                    msg = update.get("message", {})
+                    text = msg.get("text", "")
+                    user_id = str(msg.get("from", {}).get("id", ""))
                     
-                    # 보안 확인: 등록된 사용자(엔지니어님)로부터 온 명령만 실행
-                    # (이후 Manus가 직접 신호를 보낼 수 있도록 로직 확장 가능)
-                    if sender_id == CHAT_ID:
+                    if user_id == CHAT_ID:
                         if text == "/update":
-                            send_telegram_message("🔄 **원격 업데이트를 시작합니다...**")
-                            with open(os.path.expanduser("~/update_trigger"), "w") as f:
-                                f.write("update")
+                            send_message("🔄 업데이트 시작합니다...")
+                            with open(os.path.expanduser("~/tesla_telemetry_work/update_trigger"), "w") as f:
+                                f.write("1")
                             os.kill(os.getppid(), signal.SIGTERM)
                             sys.exit(0)
                         elif text == "/status":
-                            send_telegram_message("✅ **시스템 가동 중**\n- 모니터링: 최근 3분 전비\n- 기준: 4.5 km/kWh")
-                            
-        except Exception as e:
-            print(f"Error checking commands: {e}")
-        time.sleep(5)
+                            send_message("✅ 시스템 가동 중\n- 모니터링: 최근 3분 전비\n- 기준: 4.5 km/kWh")
+        except:
+            pass
+        time.sleep(3)
 
-def calculate_efficiency(data_points):
-    if not data_points: return None
-    total_speed_kmh = 0
-    total_power_kw = 0
+def calculate_efficiency(points):
+    if not points:
+        return None
+    total_speed = 0
+    total_power = 0
     count = 0
-    for dp in data_points:
-        speed = dp.get("speed", 0) * 1.60934
-        power = dp.get("power", 0)
+    for p in points:
+        speed = p.get("speed", 0) * 1.60934
+        power = abs(p.get("power", 0))
         if speed > 0:
-            total_speed_kmh += speed
-            total_power_kw += abs(power)
+            total_speed += speed
+            total_power += power
             count += 1
-    if count == 0 or total_power_kw == 0: return None
-    return round(total_speed_kmh / total_power_kw, 2)
+    if count == 0 or total_power == 0:
+        return None
+    return round(total_speed / total_power, 2)
 
-def process_telemetry_data(data):
+def process_data(data):
+    global last_alert_time
     current_time = datetime.now()
-    data["timestamp_internal"] = current_time
+    data["ts"] = current_time
     data_window.append(data)
-    while data_window and data_window[0]["timestamp_internal"] < current_time - timedelta(minutes=WINDOW_SIZE_MINUTES):
+    
+    while data_window and data_window[0]["ts"] < current_time - timedelta(minutes=WINDOW_SIZE_MINUTES):
         data_window.popleft()
+    
     if data.get("speed", 0) > 0:
         eff = calculate_efficiency(data_window)
         if eff and eff < THRESHOLD_EFFICIENCY:
-            send_telegram_message(f"📉 **전비 경고!**\n최근 {WINDOW_SIZE_MINUTES}분 평균 전비가 **{eff} km/kWh**입니다.")
+            now = time.time()
+            if now - last_alert_time > 60:
+                send_message(f"📉 전비 경고!\n최근 {WINDOW_SIZE_MINUTES}분 평균: **{eff} km/kWh**")
+                last_alert_time = now
 
 if __name__ == "__main__":
-    cmd_thread = threading.Thread(target=check_remote_commands, daemon=True)
+    # 명령 감시 스레드 시작
+    cmd_thread = threading.Thread(target=check_commands, daemon=True)
     cmd_thread.start()
     
-    print("Tesla Telemetry Handler V4 (Remote Control Ready) Started...")
-    send_telegram_message("🚀 **두삼이 관제 시스템 가동 시작**\n(원격 제어 준비 완료)")
+    send_message("🚀 두삼이 관제 시스템 가동 시작")
     
+    # 표준 입력에서 데이터 읽기
     for line in sys.stdin:
         try:
-            # Telemetry 서버가 뱉는 로그를 한 줄씩 읽어 처리
             data = json.loads(line)
-            process_telemetry_data(data)
+            process_data(data)
         except:
             continue
