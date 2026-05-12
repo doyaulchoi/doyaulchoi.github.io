@@ -31,19 +31,20 @@ DEFAULT_STATE_FILE = Path.home() / ".light_loggg_state.json"
 DEFAULT_API_BASE = "https://fleet-api.prd.na.vn.cloud.tesla.com"
 DEFAULT_CLIENT_ID = "d1351a7e-42fd-4318-b6a2-c9d702af75c1"
 AUTH_TOKEN_URL = "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token"
-VEHICLE_DATA_ENDPOINTS = ";".join(
-    [
-        "charge_state",
-        "climate_state",
-        "closures_state",
-        "drive_state",
-        "gui_settings",
-        "location_data",
-        "vehicle_config",
-        "vehicle_state",
-        "vehicle_data_combo",
-    ]
-)
+VEHICLE_DATA_ENDPOINT_LIST = [
+    "charge_state",
+    "climate_state",
+    "closures_state",
+    "drive_state",
+    "gui_settings",
+    "location_data",
+    "vehicle_config",
+    "vehicle_state",
+    "vehicle_data_combo",
+]
+VEHICLE_DATA_ENDPOINTS = ";".join(VEHICLE_DATA_ENDPOINT_LIST)
+VEHICLE_DATA_ENDPOINTS_WITHOUT_LOCATION = ";".join(endpoint for endpoint in VEHICLE_DATA_ENDPOINT_LIST if endpoint != "location_data")
+DEFAULT_TESLA_SCOPE = "openid offline_access user_data vehicle_device_data vehicle_location"
 
 POLL_ASLEEP_SECONDS = int(os.getenv("LIGHT_LOGGG_POLL_ASLEEP_SECONDS", "300"))
 POLL_ONLINE_SECONDS = int(os.getenv("LIGHT_LOGGG_POLL_ONLINE_SECONDS", "60"))
@@ -192,7 +193,7 @@ class TeslaFleetClient:
         self.refresh_token = self.tokens.get("refresh_token")
         self.client_id = os.getenv("TESLA_CLIENT_ID") or os.getenv("TESLA_AUTH_CLIENT_ID") or DEFAULT_CLIENT_ID
         self.client_secret = os.getenv("TESLA_CLIENT_SECRET", "")
-        self.scope = os.getenv("TESLA_SCOPE", "openid offline_access user_data vehicle_device_data")
+        self.scope = os.getenv("TESLA_SCOPE", DEFAULT_TESLA_SCOPE)
 
     def access_token_valid(self) -> bool:
         return bool(self.access_token and self.access_token_expires_at > time.time() + 120)
@@ -298,11 +299,27 @@ class TeslaFleetClient:
         return self.request("GET", f"/api/1/vehicles/{vehicle_id}").get("response", {})
 
     def vehicle_data(self, vehicle_id: str) -> Dict[str, Any]:
-        return self.request(
-            "GET",
-            f"/api/1/vehicles/{vehicle_id}/vehicle_data",
-            params={"endpoints": VEHICLE_DATA_ENDPOINTS},
-        ).get("response", {})
+        try:
+            return self.request(
+                "GET",
+                f"/api/1/vehicles/{vehicle_id}/vehicle_data",
+                params={"endpoints": VEHICLE_DATA_ENDPOINTS},
+            ).get("response", {})
+        except RuntimeError as exc:
+            message = str(exc)
+            if "HTTP 403" in message and "vehicle_location" in message:
+                print(
+                    "Tesla token lacks vehicle_location scope; retrying vehicle_data without location_data. "
+                    "Re-run light_loggg_tesla_oauth.py to grant location access.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return self.request(
+                    "GET",
+                    f"/api/1/vehicles/{vehicle_id}/vehicle_data",
+                    params={"endpoints": VEHICLE_DATA_ENDPOINTS_WITHOUT_LOCATION},
+                ).get("response", {})
+            raise
 
 
 class LightLogggPoller:

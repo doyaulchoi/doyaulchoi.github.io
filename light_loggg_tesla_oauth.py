@@ -28,7 +28,7 @@ REDIRECT_URI = os.environ.get("TESLA_REDIRECT_URI", "https://doyaulchoi.github.i
 AUDIENCE = os.environ.get("TESLA_AUDIENCE", "https://fleet-api.prd.na.vn.cloud.tesla.com")
 TOKEN_URL = "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token"
 AUTH_URL = "https://auth.tesla.com/oauth2/v3/authorize"
-DEFAULT_SCOPE = "openid offline_access user_data vehicle_device_data"
+DEFAULT_SCOPE = "openid offline_access user_data vehicle_device_data vehicle_location"
 DEFAULT_TOKEN_FILE = Path.home() / ".light_loggg_tesla_tokens.json"
 DEFAULT_STATE_FILE = Path.home() / ".light_loggg_state.json"
 
