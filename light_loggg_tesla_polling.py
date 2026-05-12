@@ -584,29 +584,61 @@ class LightLogggPoller:
         if sample.latitude is not None and sample.longitude is not None:
             self.state["daily"]["last_location"] = {"lat": sample.latitude, "lon": sample.longitude}
 
+    def update_last_poll(self, status: str, vehicle: Optional[Dict[str, Any]], interval: int, sample: Optional[Sample] = None) -> None:
+        payload: Dict[str, Any] = {
+            "time": now_kst().isoformat(),
+            "status": status,
+            "next_seconds": interval,
+            "vehicle_id": self.vehicle_id,
+            "vehicle_name": self.vehicle_name,
+        }
+        if vehicle:
+            charge_state = vehicle.get("charge_state") or {}
+            vehicle_state = vehicle.get("vehicle_state") or {}
+            drive_state = vehicle.get("drive_state") or {}
+            payload["charging_state"] = charge_state.get("charging_state")
+            payload["battery_level"] = charge_state.get("battery_level")
+            payload["shift_state"] = drive_state.get("shift_state")
+            odometer_miles = as_float(vehicle_state.get("odometer"))
+            if odometer_miles is not None:
+                payload["odometer_km"] = round(odometer_miles * 1.609344, 1)
+        if sample:
+            payload["speed_kmh"] = round(sample.speed_kmh, 1) if sample.speed_kmh is not None else None
+            payload["latitude"] = sample.latitude
+            payload["longitude"] = sample.longitude
+        self.state["last_poll"] = payload
+
     def process_vehicle(self, status: str, vehicle: Optional[Dict[str, Any]]) -> int:
         self.restore_state()
         if not vehicle or status in {"offline", "asleep"}:
+            interval = POLL_ASLEEP_SECONDS
             if self.drive.active:
                 synthetic = Sample(now_kst(), None, None, None, None, None, None, None)
                 self.finish_drive_if_needed(synthetic)
+            self.update_last_poll(status, vehicle, interval)
             self.maybe_scheduled_summary()
             self.save_state()
-            return POLL_ASLEEP_SECONDS
+            return interval
         sample = self.sample_from_vehicle(vehicle)
         if self.is_driving(sample):
             self.handle_driving_sample(sample)
+            interval = POLL_DRIVING_SECONDS
+            self.update_last_poll(status, vehicle, interval, sample)
             self.maybe_scheduled_summary()
             self.save_state()
-            return POLL_DRIVING_SECONDS
+            return interval
         self.finish_drive_if_needed(sample)
         if self.is_charging(vehicle):
+            interval = POLL_CHARGING_SECONDS
+            self.update_last_poll(status, vehicle, interval, sample)
             self.maybe_scheduled_summary()
             self.save_state()
-            return POLL_CHARGING_SECONDS
+            return interval
+        interval = POLL_ONLINE_SECONDS
+        self.update_last_poll(status, vehicle, interval, sample)
         self.maybe_scheduled_summary()
         self.save_state()
-        return POLL_ONLINE_SECONDS
+        return interval
 
     def maybe_home_arrival(self, sample: Sample) -> None:
         daily = self.state["daily"]
