@@ -258,10 +258,10 @@ def init_runtime_config(config_file: Path) -> None:
         PUBLIC_CONFIG, "polling", "online_seconds", "LIGHT_LOGGG_POLL_ONLINE_SECONDS", 300
     )
     POLL_DRIVING_SECONDS = cfg_int(
-        PUBLIC_CONFIG, "polling", "driving_seconds", "LIGHT_LOGGG_POLL_DRIVING_SECONDS", 10
+        PUBLIC_CONFIG, "polling", "driving_seconds", "LIGHT_LOGGG_POLL_DRIVING_SECONDS", 300
     )
     POLL_CHARGING_SECONDS = cfg_int(
-        PUBLIC_CONFIG, "polling", "charging_seconds", "LIGHT_LOGGG_POLL_CHARGING_SECONDS", 60
+        PUBLIC_CONFIG, "polling", "charging_seconds", "LIGHT_LOGGG_POLL_CHARGING_SECONDS", 300
     )
     POLL_ERROR_SECONDS = cfg_int(
         PUBLIC_CONFIG, "polling", "error_seconds", "LIGHT_LOGGG_POLL_ERROR_SECONDS", 300
@@ -1740,16 +1740,21 @@ class LightLogggPoller:
                     self.state["charge_session"] = charge_session
 
                 if current_charging_state == "Complete":
+                    if battery_level is not None:
+                        complete_battery_text = f"{battery_level:.0f}%"
+                    else:
+                        complete_battery_text = "확인 불가"
+
                     self.telegram.send(
                         "충전 완료\n"
-                        f"- 현재 배터리: {battery_level:.0f}%" if battery_level is not None else "- 현재 배터리: 확인 불가"
+                        f"- 현재 배터리: {complete_battery_text}"
                     )
 
             self.charging_notification_stage = "idle"
             self.charging_start_timestamp = None
 
         self.handle_morning_alert(vehicle)
-        self.handle_scheduled_reports()        
+              
         if not vehicle or status in {"offline", "asleep"}:
             if self.should_boost_driving():
                 interval = POLL_DRIVING_SECONDS
@@ -1757,6 +1762,7 @@ class LightLogggPoller:
                 interval = POLL_ASLEEP_SECONDS
 
             self.update_last_poll(status, vehicle, interval)
+            self.handle_scheduled_reports()
             self.save_state()
             return interval
 
@@ -1782,6 +1788,7 @@ class LightLogggPoller:
                 interval = POLL_ONLINE_SECONDS
 
             self.update_last_poll(status, vehicle, interval, sample)
+            self.handle_scheduled_reports()
             self.save_state()
             return interval
 
@@ -1810,6 +1817,7 @@ class LightLogggPoller:
                 interval = POLL_ONLINE_SECONDS
 
         self.update_last_poll(status, vehicle, interval, sample)
+        self.handle_scheduled_reports()
         self.save_state()
         return interval
 
