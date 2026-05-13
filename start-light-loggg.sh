@@ -70,6 +70,11 @@ PY
     exit 1
   fi
 
+  if [ ! -f "$COMMAND_SERVER_SCRIPT" ]; then
+    echo "Command server script not found: $COMMAND_SERVER_SCRIPT"
+    exit 1
+  fi
+
   echo "[6] Loading env..."
   if [ -f "$ENV_FILE" ]; then
     set -a
