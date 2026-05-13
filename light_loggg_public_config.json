@@ -1,0 +1,20 @@
+{
+  "polling": {
+    "asleep_seconds": 1800,
+    "online_seconds": 300,
+    "driving_seconds": 10,
+    "charging_seconds": 60,
+    "error_seconds": 300
+  },
+  "alerts": {
+    "threshold_km_per_kwh": 4.5,
+    "window_minutes": 3,
+    "alert_cooldown_seconds": 60
+  },
+  "external_commands": {
+    "drive_boost_seconds": 180
+  },
+  "request": {
+    "timeout_seconds": 25
+  }
+}
