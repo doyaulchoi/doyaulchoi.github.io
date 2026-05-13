@@ -37,6 +37,12 @@ RAW_BASE = os.getenv(
     "LIGHT_LOGGG_RAW_BASE",
     "https://raw.githubusercontent.com/doyaulchoi/doyaulchoi.github.io/main",
 )
+REPO_URL = os.getenv(
+    "LIGHT_LOGGG_REPO_URL",
+    "https://github.com/doyaulchoi/doyaulchoi.github.io.git",
+)
+
+REPO_BRANCH = os.getenv("LIGHT_LOGGG_REPO_BRANCH", "main")
 
 APP_DIR = Path.home() / "light_loggg_tesla"
 LOG_DIR = APP_DIR / "logs"
@@ -209,6 +215,18 @@ def split_telegram_text(text: str, limit: int = 3500) -> list[str]:
         chunks.append(remaining)
 
     return chunks
+
+
+def extract_fail_lines(text: str) -> list[str]:
+    lines = []
+
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+
+        if "[FAIL]" in stripped:
+            lines.append(stripped)
+
+    return lines
 
 
 def format_config_status(state: Dict[str, Any]) -> list[str]:
@@ -439,6 +457,61 @@ def download_file(filename: str) -> None:
             pass
 
 
+def git_update_repo() -> str:
+    if not (APP_DIR / ".git").exists():
+        raise RuntimeError(
+            f"{APP_DIR}는 git repo가 아님. "
+            "최초 1회는 git clone 방식으로 전환해야 함."
+        )
+
+    # GitHub가 원본이다. 로컬 수정 충돌 방지용으로 pull보다 fetch+reset을 쓴다.
+    remote_result = run_command(
+        ["git", "remote", "set-url", "origin", REPO_URL],
+        cwd=APP_DIR,
+        timeout=30,
+    )
+
+    if remote_result.returncode != 0:
+        raise RuntimeError(f"git remote set-url 실패: {remote_result.stderr or remote_result.stdout}")
+
+    fetch_result = run_command(
+        ["git", "fetch", "origin", REPO_BRANCH],
+        cwd=APP_DIR,
+        timeout=120,
+    )
+
+    if fetch_result.returncode != 0:
+        raise RuntimeError(f"git fetch 실패: {fetch_result.stderr or fetch_result.stdout}")
+
+    reset_result = run_command(
+        ["git", "reset", "--hard", f"origin/{REPO_BRANCH}"],
+        cwd=APP_DIR,
+        timeout=60,
+    )
+
+    if reset_result.returncode != 0:
+        raise RuntimeError(f"git reset 실패: {reset_result.stderr or reset_result.stdout}")
+
+    chmod_result = run_command(
+        ["sh", "-c", "chmod +x *.py *.sh 2>/dev/null || true"],
+        cwd=APP_DIR,
+        timeout=30,
+    )
+
+    if chmod_result.returncode != 0:
+        raise RuntimeError(f"chmod 실패: {chmod_result.stderr or chmod_result.stdout}")
+
+    head_result = run_command(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=APP_DIR,
+        timeout=10,
+    )
+
+    head = (head_result.stdout or "").strip() if head_result.returncode == 0 else "unknown"
+
+    return f"git 전체 업데이트 완료: {REPO_BRANCH}@{head}"
+  
+
 def py_compile_file(path: Path) -> None:
     result = run_command(
         [sys.executable, "-m", "py_compile", str(path)],
@@ -560,23 +633,17 @@ def run_system_check() -> tuple[int, str]:
     return result.returncode, output
 
 
-def summarize_check_result(exit_code: int, output: str) -> str:
-    fail_count = output.count("[FAIL]")
-    warn_count = output.count("[WARN]")
-    ok_count = output.count("[OK]")
+def summarize_check_result(exit_code: int, output: str) -> tuple[bool, str]:
+    fail_lines = extract_fail_lines(output)
 
-    if exit_code == 0 and fail_count == 0:
-        headline = "check_system 완료: 치명 오류 없음"
-    else:
-        headline = "check_system 완료: 확인 필요"
+    if exit_code == 0 and not fail_lines:
+        return True, "OK"
 
-    return (
-        f"{headline}\n"
-        f"- exit_code: {exit_code}\n"
-        f"- OK: {ok_count}\n"
-        f"- WARN: {warn_count}\n"
-        f"- FAIL: {fail_count}"
-    )
+    if fail_lines:
+        message = "업데이트 완료, 확인 필요\n" + "\n".join(fail_lines)
+        return False, message
+
+    return False, f"업데이트 완료, check_system exit_code={exit_code}"
 
 
 def write_command(command: Dict[str, Any]) -> None:
@@ -590,12 +657,11 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         append_update_log("==== UPDATE START ====")
 
-        telegram_bot.send(chat_id, "코드 업데이트를 시작합니다.")
+        telegram_bot.send(chat_id, "GitHub 전체 업데이트를 시작합니다.")
 
-        for filename in UPDATE_FILES:
-            download_file(filename)
+        git_msg = git_update_repo()
 
-        telegram_bot.send(chat_id, "GitHub raw 파일 다운로드 완료. 검사를 시작합니다.")
+        telegram_bot.send(chat_id, "GitHub 전체 업데이트 완료. 검사를 시작합니다.")
 
         config_msg = validate_public_config()
 
@@ -622,28 +688,12 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
         time.sleep(5)
 
         check_exit_code, check_output = run_system_check()
-        check_summary = summarize_check_result(check_exit_code, check_output)
+        check_ok, check_message = summarize_check_result(check_exit_code, check_output)
 
-        elapsed = int((now_kst() - started_at).total_seconds())
-
-        telegram_bot.send(
-            chat_id,
-            "업데이트 완료\n"
-            f"- {config_msg}\n"
-            f"- {boot_msg}\n"
-            f"- {stop_msg}\n"
-            f"- 새 polling PID: {new_pid}\n"
-            f"- 소요 시간: {elapsed}초\n"
-            f"\n{check_summary}\n"
-            "\n참고: Telegram bot 자신은 현재 프로세스 그대로 유지됩니다. "
-            "bot 코드 변경은 다음 부팅 또는 수동 재시작 후 완전히 반영됩니다.",
-        )
-
-        telegram_bot.send(
-            chat_id,
-            "check_system 상세 결과\n"
-            + check_output,
-        )
+        if check_ok:
+            telegram_bot.send(chat_id, "OK")
+        else:
+            telegram_bot.send(chat_id, check_message)
 
         append_update_log("==== UPDATE END OK ====")
 
@@ -658,12 +708,11 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
 
         try:
             check_exit_code, check_output = run_system_check()
-            check_summary = summarize_check_result(check_exit_code, check_output)
+            _check_ok, check_message = summarize_check_result(check_exit_code, check_output)
             telegram_bot.send(
                 chat_id,
                 "업데이트 실패 후 check_system 결과\n"
-                f"{check_summary}\n\n"
-                f"{check_output}",
+                f"{check_message}",
             )
         except Exception as check_exc:
             telegram_bot.send(
@@ -745,11 +794,12 @@ class TelegramBot:
 
         elif command in {"/check", "check", "/check_system", "check_system"}:
             exit_code, output = run_system_check()
-            summary = summarize_check_result(exit_code, output)
-            self.send(
-                chat_id,
-                summary + "\n\n" + output,
-            )
+            check_ok, check_message = summarize_check_result(exit_code, output)
+
+            if check_ok:
+                self.send(chat_id, "OK")
+            else:
+                self.send(chat_id, check_message)
 
         elif command in {"/poll_now", "poll_now"}:
             write_command(
