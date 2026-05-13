@@ -106,6 +106,15 @@ DEFAULT_PUBLIC_CONFIG: Dict[str, Any] = {
 }
 
 
+    "daily_report": {
+        "enabled": True,
+        "hour": 19,
+        "minute": 0,
+        "weekly_enabled": True,
+        "weekly_day": 4
+    },
+
+
 # =========================
 # Config helpers
 # =========================
@@ -187,6 +196,26 @@ def cfg_float(config: Dict[str, Any], section: str, key: str, env_key: str, defa
         return default
 
 
+def cfg_bool(config: Dict[str, Any], section: str, key: str, env_key: str, default: bool) -> bool:
+    if env_key in os.environ:
+        value = os.environ.get(env_key, "").strip().lower()
+        return value in {"1", "true", "yes", "y", "on"}
+
+    try:
+        value = (config.get(section) or {}).get(key, default)
+
+        if isinstance(value, bool):
+            return value
+
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+        return bool(value)
+
+    except Exception:
+        return default
+
+
 # 전역 설정값은 main()에서 env/config 로드 후 초기화된다.
 PUBLIC_CONFIG: Dict[str, Any] = dict(DEFAULT_PUBLIC_CONFIG)
 
@@ -205,6 +234,11 @@ EXTERNAL_DRIVE_BOOST_SECONDS = 180
 
 MORNING_ALERT_HOUR = 6
 MORNING_ALERT_MINUTE = 30
+DAILY_REPORT_ENABLED = True
+DAILY_REPORT_HOUR = 19
+DAILY_REPORT_MINUTE = 0
+WEEKLY_REPORT_ENABLED = True
+WEEKLY_REPORT_DAY = 4
 
 
 def init_runtime_config(config_file: Path) -> None:
@@ -214,6 +248,8 @@ def init_runtime_config(config_file: Path) -> None:
     global WINDOW_SIZE_MINUTES, THRESHOLD_EFFICIENCY, LOW_EFFICIENCY_ALERT_COOLDOWN
     global REQUEST_TIMEOUT, EXTERNAL_DRIVE_BOOST_SECONDS
     global MORNING_ALERT_HOUR, MORNING_ALERT_MINUTE
+    global DAILY_REPORT_ENABLED, DAILY_REPORT_HOUR, DAILY_REPORT_MINUTE
+    global WEEKLY_REPORT_ENABLED, WEEKLY_REPORT_DAY
 
     PUBLIC_CONFIG = load_public_config(config_file)
 
@@ -256,6 +292,21 @@ def init_runtime_config(config_file: Path) -> None:
     )
     MORNING_ALERT_MINUTE = cfg_int(
         PUBLIC_CONFIG, "morning_alert", "minute", "LIGHT_LOGGG_MORNING_ALERT_MINUTE", 30
+    )
+        DAILY_REPORT_ENABLED = cfg_bool(
+        PUBLIC_CONFIG, "daily_report", "enabled", "LIGHT_LOGGG_DAILY_REPORT_ENABLED", True
+    )
+    DAILY_REPORT_HOUR = cfg_int(
+        PUBLIC_CONFIG, "daily_report", "hour", "LIGHT_LOGGG_DAILY_REPORT_HOUR", 19
+    )
+    DAILY_REPORT_MINUTE = cfg_int(
+        PUBLIC_CONFIG, "daily_report", "minute", "LIGHT_LOGGG_DAILY_REPORT_MINUTE", 0
+    )
+    WEEKLY_REPORT_ENABLED = cfg_bool(
+        PUBLIC_CONFIG, "daily_report", "weekly_enabled", "LIGHT_LOGGG_WEEKLY_REPORT_ENABLED", True
+    )
+    WEEKLY_REPORT_DAY = cfg_int(
+        PUBLIC_CONFIG, "daily_report", "weekly_day", "LIGHT_LOGGG_WEEKLY_REPORT_DAY", 4
     )
 
     print(
@@ -407,6 +458,24 @@ def format_eta_clock(hours_value: Optional[float]) -> str:
         return f"{eta.strftime('%H:%M')}(D+{day_delta})"
 
     return eta.strftime("%H:%M")
+
+
+def format_seconds_hm(seconds_value: Optional[float]) -> str:
+    if seconds_value is None or seconds_value <= 0:
+        return "0분"
+
+    total_minutes = int(round(seconds_value / 60))
+
+    if total_minutes < 60:
+        return f"{total_minutes}분"
+
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+
+    if minutes > 0:
+        return f"{hours}시간 {minutes}분"
+
+    return f"{hours}시간"
 
 
 TRIP_CSV_FIELDS = [
@@ -1156,7 +1225,137 @@ class LightLogggPoller:
             f"- 평균속도: {avg_speed:.1f} km/h"
         )
 
-    
+
+    def daily_report_due(self) -> bool:
+        if not DAILY_REPORT_ENABLED:
+            return False
+
+        now = now_kst()
+        today_str = now.date().isoformat()
+
+        target = now.replace(
+            hour=DAILY_REPORT_HOUR,
+            minute=DAILY_REPORT_MINUTE,
+            second=0,
+            microsecond=0,
+        )
+
+        if now < target:
+            return False
+
+        return self.state.get("last_summary_date") != today_str
+
+    def weekly_report_due(self) -> bool:
+        if not WEEKLY_REPORT_ENABLED:
+            return False
+
+        now = now_kst()
+
+        if now.weekday() != WEEKLY_REPORT_DAY:
+            return False
+
+        target = now.replace(
+            hour=DAILY_REPORT_HOUR,
+            minute=DAILY_REPORT_MINUTE,
+            second=0,
+            microsecond=0,
+        )
+
+        if now < target:
+            return False
+
+        current_week = now.strftime("%Y-W%U")
+
+        return self.state.get("last_weekly_summary_iso") != current_week
+
+    def build_daily_report_text(self) -> str:
+        daily = self.state.get("daily") or {}
+
+        date_text = daily.get("date") or now_kst().date().isoformat()
+        distance = float(daily.get("total_distance_km") or 0.0)
+        seconds = float(daily.get("total_time_seconds") or 0.0)
+        sessions = daily.get("drive_sessions") or []
+
+        start_soc = as_float(daily.get("start_soc"))
+        end_soc = as_float(daily.get("end_soc"))
+
+        avg_speed = distance / (seconds / 3600.0) if seconds > 0 else 0.0
+
+        lines = [
+            "두삼이 일일 리포트",
+            f"- 날짜: {date_text}",
+            f"- 주행 횟수: {len(sessions)}회",
+            f"- 총 주행거리: {distance:.2f} km",
+            f"- 총 주행시간: {format_seconds_hm(seconds)}",
+            f"- 평균속도: {avg_speed:.1f} km/h",
+        ]
+
+        if start_soc is not None and end_soc is not None:
+            lines.append(
+                f"- 배터리: {start_soc:.0f}% → {end_soc:.0f}% ({start_soc - end_soc:.0f}%p 사용)"
+            )
+        else:
+            lines.append("- 배터리: 확인 불가")
+
+        if distance < 1.0:
+            lines.append("- 비고: 오늘 기록된 주행거리 1km 미만")
+
+        return "\n".join(lines)
+
+    def build_weekly_report_text(self) -> str:
+        weekly = self.state.get("weekly") or {}
+
+        week_text = weekly.get("week") or now_kst().strftime("%Y-W%U")
+        distance = float(weekly.get("total_distance_km") or 0.0)
+        seconds = float(weekly.get("total_time_seconds") or 0.0)
+        drive_count = int(weekly.get("drive_count") or 0)
+
+        avg_speed = distance / (seconds / 3600.0) if seconds > 0 else 0.0
+
+        days = weekly.get("days") or {}
+
+        lines = [
+            "두삼이 주간 리포트",
+            f"- 주차: {week_text}",
+            f"- 주행 횟수: {drive_count}회",
+            f"- 총 주행거리: {distance:.2f} km",
+            f"- 총 주행시간: {format_seconds_hm(seconds)}",
+            f"- 평균속도: {avg_speed:.1f} km/h",
+        ]
+
+        if days:
+            lines.append("")
+            lines.append("일자별 요약")
+
+            for day_key in sorted(days.keys()):
+                day = days.get(day_key) or {}
+                day_distance = float(day.get("distance_km") or 0.0)
+                day_seconds = float(day.get("time_seconds") or 0.0)
+                day_count = int(day.get("drive_count") or 0)
+
+                lines.append(
+                    f"- {day_key}: {day_distance:.2f} km / {format_seconds_hm(day_seconds)} / {day_count}회"
+                )
+
+        if distance < 1.0:
+            lines.append("")
+            lines.append("- 비고: 이번 주 기록된 주행거리 1km 미만")
+
+        return "\n".join(lines)
+
+    def handle_scheduled_reports(self) -> None:
+        today_str = now_kst().date().isoformat()
+        current_week = now_kst().strftime("%Y-W%U")
+
+        if self.daily_report_due():
+            self.telegram.send(self.build_daily_report_text())
+            self.state["last_summary_date"] = today_str
+
+        if self.weekly_report_due():
+            self.telegram.send(self.build_weekly_report_text())
+            self.state["last_weekly_summary_iso"] = current_week
+
+
     # -------------------------
     # Vehicle parsing
     # -------------------------
@@ -1551,6 +1750,7 @@ class LightLogggPoller:
             self.charging_start_timestamp = None
 
         self.handle_morning_alert(vehicle)
+        self.handle_scheduled_reports()        
         if not vehicle or status in {"offline", "asleep"}:
             if self.should_boost_driving():
                 interval = POLL_DRIVING_SECONDS
