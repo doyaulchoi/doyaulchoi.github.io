@@ -56,10 +56,14 @@ PUBLIC_CONFIG_FILE = APP_DIR / "light_loggg_public_config.json"
 
 DEFAULT_LOG_FILE = LOG_DIR / "polling.log"
 BOT_LOG_FILE = LOG_DIR / "telegram_bot.log"
+COMMAND_SERVER_LOG_FILE = LOG_DIR / "command_server.log"
 UPDATE_LOG_FILE = LOG_DIR / "update.log"
+
+COMMAND_SERVER_PID_FILE = APP_DIR / "command_server.pid"
 
 POLLING_SCRIPT_PATH = APP_DIR / "light_loggg_tesla_polling.py"
 BOT_SCRIPT_PATH = APP_DIR / "light_loggg_telegram_bot.py"
+COMMAND_SERVER_SCRIPT_PATH = APP_DIR / "light_loggg_command_server.py"
 CHECK_SCRIPT_PATH = APP_DIR / "check_system.py"
 
 BOOT_SOURCE_FILE = APP_DIR / "start-light-loggg.sh"
@@ -72,6 +76,7 @@ UPDATE_FILES = [
     "light_loggg_public_config.json",
     "light_loggg_tesla_polling.py",
     "light_loggg_telegram_bot.py",
+    "light_loggg_command_server.py",
     "light_loggg_tesla_oauth.py",
     "check_system.py",
     "start-light-loggg.sh",
@@ -369,6 +374,7 @@ def format_status(state_file: Path) -> str:
 
     polling_pid = read_pid(DEFAULT_PID_FILE)
     bot_pid = read_pid(BOT_PID_FILE)
+    command_server_pid = read_pid(COMMAND_SERVER_PID_FILE)
 
     public_config_exists = PUBLIC_CONFIG_FILE.exists()
 
@@ -400,6 +406,9 @@ def format_status(state_file: Path) -> str:
 
     if bot_pid is not None:
         lines.append(f"bot PID: {bot_pid}")
+
+    if command_server_pid is not None:
+        lines.append(f"command server PID: {command_server_pid}")
 
     lines.append(f"공개 설정 파일: {'있음' if public_config_exists else '없음'}")
 
@@ -632,6 +641,64 @@ def start_polling_process() -> int:
     return process.pid
 
 
+def stop_command_server_process() -> str:
+    pid = read_pid(COMMAND_SERVER_PID_FILE)
+
+    if pid is None:
+        run_command(["pkill", "-f", "light_loggg_command_server.py"], timeout=10)
+        COMMAND_SERVER_PID_FILE.unlink(missing_ok=True)
+        return "command server PID 파일 없음. pkill로 정리 시도함."
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(2)
+
+        try:
+            os.kill(pid, 0)
+            os.kill(pid, signal.SIGKILL)
+            time.sleep(1)
+        except ProcessLookupError:
+            pass
+
+        COMMAND_SERVER_PID_FILE.unlink(missing_ok=True)
+        return f"command server PID {pid} 종료 완료"
+
+    except ProcessLookupError:
+        COMMAND_SERVER_PID_FILE.unlink(missing_ok=True)
+        return f"command server PID {pid}는 이미 종료됨"
+
+    except Exception as exc:
+        run_command(["pkill", "-f", "light_loggg_command_server.py"], timeout=10)
+        COMMAND_SERVER_PID_FILE.unlink(missing_ok=True)
+        return f"command server 종료 중 오류. pkill fallback 실행: {exc}"
+
+
+def start_command_server_process() -> Optional[int]:
+    if not COMMAND_SERVER_SCRIPT_PATH.exists():
+        return None
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    python_executable = shutil.which("python3") or shutil.which("python") or sys.executable
+
+    if not python_executable:
+        raise RuntimeError("python 실행 파일을 찾지 못함")
+
+    log_file = COMMAND_SERVER_LOG_FILE.open("a", encoding="utf-8")
+
+    process = subprocess.Popen(
+        [python_executable, str(COMMAND_SERVER_SCRIPT_PATH), "--daemon"],
+        cwd=str(APP_DIR),
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    COMMAND_SERVER_PID_FILE.write_text(str(process.pid) + "\n", encoding="utf-8")
+
+    return process.pid
+
+
 def restart_bot_process_after_reply() -> None:
     python_executable = shutil.which("python3") or shutil.which("python") or sys.executable
 
@@ -716,6 +783,7 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
         optional_python_files = [
             APP_DIR / "light_loggg_tesla_oauth.py",
             APP_DIR / "check_system.py",
+            COMMAND_SERVER_SCRIPT_PATH,
             APP_DIR / "telemetry_server.py",
             APP_DIR / "tesla_telemetry_handler.py",
         ]
@@ -727,7 +795,10 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
         boot_msg = install_boot_script()
 
         stop_msg = stop_polling_process()
+        command_stop_msg = stop_command_server_process()
+
         new_pid = start_polling_process()
+        command_server_pid = start_command_server_process()
 
         # Give polling a little time to write last_poll/logs after restart.
         time.sleep(5)
