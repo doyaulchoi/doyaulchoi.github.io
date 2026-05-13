@@ -7,11 +7,18 @@ LIGHT LOGGG Tesla Fleet API polling handler.
 - 차량이 asleep/offline이면 vehicle_data 호출하지 않음
 - 주행/충전/온라인/수면 상태별 polling 주기 분리
 - Telegram 상태 알림/요약용 state 저장
-- 향후 세컨폰/Telegram 명령으로 polling 즉시 깨우기 지원
+- 세컨폰/Telegram 명령으로 polling 즉시 깨우기 지원
 
-중요:
-- GitHub에는 코드만 둔다.
-- token, secret, Telegram bot token은 ~/.light_loggg.env 및 로컬 token 파일에만 둔다.
+설정 구조:
+- 공개 설정: ~/light_loggg_tesla/light_loggg_public_config.json
+- 비공개 설정: ~/.light_loggg.env
+- token 파일: ~/.light_loggg_tesla_tokens.json
+- state 파일: ~/.light_loggg_state.json
+
+우선순위:
+1. 환경변수 / ~/.light_loggg.env
+2. light_loggg_public_config.json
+3. 코드 기본값
 """
 
 from __future__ import annotations
@@ -33,7 +40,7 @@ import requests
 
 
 # =========================
-# Constants / defaults
+# Paths / defaults
 # =========================
 
 KST = timezone(timedelta(hours=9))
@@ -41,6 +48,7 @@ KST = timezone(timedelta(hours=9))
 APP_DIR = Path.home() / "light_loggg_tesla"
 LOG_DIR = APP_DIR / "logs"
 
+DEFAULT_PUBLIC_CONFIG_FILE = APP_DIR / "light_loggg_public_config.json"
 DEFAULT_TOKEN_FILE = Path.home() / ".light_loggg_tesla_tokens.json"
 DEFAULT_STATE_FILE = Path.home() / ".light_loggg_state.json"
 DEFAULT_COMMAND_FILE = APP_DIR / "command.json"
@@ -70,28 +78,34 @@ VEHICLE_DATA_ENDPOINTS_WITHOUT_LOCATION = ";".join(
 
 DEFAULT_TESLA_SCOPE = "openid offline_access user_data vehicle_device_data vehicle_location"
 
-POLL_ASLEEP_SECONDS = int(os.getenv("LIGHT_LOGGG_POLL_ASLEEP_SECONDS", "1800"))
-POLL_ONLINE_SECONDS = int(os.getenv("LIGHT_LOGGG_POLL_ONLINE_SECONDS", "300"))
-POLL_DRIVING_SECONDS = int(os.getenv("LIGHT_LOGGG_POLL_DRIVING_SECONDS", "10"))
-POLL_CHARGING_SECONDS = int(os.getenv("LIGHT_LOGGG_POLL_CHARGING_SECONDS", "60"))
-POLL_ERROR_SECONDS = int(os.getenv("LIGHT_LOGGG_POLL_ERROR_SECONDS", "300"))
-
-WINDOW_SIZE_MINUTES = float(os.getenv("LIGHT_LOGGG_WINDOW_MINUTES", "3"))
-THRESHOLD_EFFICIENCY = float(os.getenv("LIGHT_LOGGG_THRESHOLD_KM_PER_KWH", "4.5"))
-LOW_EFFICIENCY_ALERT_COOLDOWN = int(os.getenv("LIGHT_LOGGG_ALERT_COOLDOWN_SECONDS", "60"))
-
-REQUEST_TIMEOUT = int(os.getenv("LIGHT_LOGGG_REQUEST_TIMEOUT", "25"))
-
-# 세컨폰/Telegram이 driving_start 명령을 보냈을 때 몇 초 동안 polling을 촘촘하게 유지할지
-EXTERNAL_DRIVE_BOOST_SECONDS = int(os.getenv("LIGHT_LOGGG_EXTERNAL_DRIVE_BOOST_SECONDS", "180"))
-
-# morning alert
-MORNING_ALERT_HOUR = int(os.getenv("LIGHT_LOGGG_MORNING_ALERT_HOUR", "6"))
-MORNING_ALERT_MINUTE = int(os.getenv("LIGHT_LOGGG_MORNING_ALERT_MINUTE", "30"))
+DEFAULT_PUBLIC_CONFIG: Dict[str, Any] = {
+    "polling": {
+        "asleep_seconds": 1800,
+        "online_seconds": 300,
+        "driving_seconds": 10,
+        "charging_seconds": 60,
+        "error_seconds": 300,
+    },
+    "alerts": {
+        "threshold_km_per_kwh": 4.5,
+        "window_minutes": 3,
+        "alert_cooldown_seconds": 60,
+    },
+    "external_commands": {
+        "drive_boost_seconds": 180,
+    },
+    "request": {
+        "timeout_seconds": 25,
+    },
+    "morning_alert": {
+        "hour": 6,
+        "minute": 30,
+    },
+}
 
 
 # =========================
-# Utility functions
+# Config helpers
 # =========================
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -112,6 +126,152 @@ def load_dotenv(path: Path = Path(".env")) -> None:
         if key and key not in os.environ:
             os.environ[key] = value
 
+
+def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(base)
+
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+
+    return result
+
+
+def load_public_config(path: Path) -> Dict[str, Any]:
+    config = dict(DEFAULT_PUBLIC_CONFIG)
+
+    if not path.exists():
+        return config
+
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+
+        if not isinstance(loaded, dict):
+            print(f"public config ignored: top-level is not object: {path}", file=sys.stderr, flush=True)
+            return config
+
+        return deep_merge(config, loaded)
+
+    except Exception as exc:
+        print(f"public config load failed: {exc}", file=sys.stderr, flush=True)
+        return config
+
+
+def cfg_int(config: Dict[str, Any], section: str, key: str, env_key: str, default: int) -> int:
+    if env_key in os.environ:
+        try:
+            return int(os.environ[env_key])
+        except Exception:
+            print(f"invalid env int {env_key}={os.environ.get(env_key)}; using config/default", file=sys.stderr, flush=True)
+
+    try:
+        return int((config.get(section) or {}).get(key, default))
+    except Exception:
+        return default
+
+
+def cfg_float(config: Dict[str, Any], section: str, key: str, env_key: str, default: float) -> float:
+    if env_key in os.environ:
+        try:
+            return float(os.environ[env_key])
+        except Exception:
+            print(f"invalid env float {env_key}={os.environ.get(env_key)}; using config/default", file=sys.stderr, flush=True)
+
+    try:
+        return float((config.get(section) or {}).get(key, default))
+    except Exception:
+        return default
+
+
+# 전역 설정값은 main()에서 env/config 로드 후 초기화된다.
+PUBLIC_CONFIG: Dict[str, Any] = dict(DEFAULT_PUBLIC_CONFIG)
+
+POLL_ASLEEP_SECONDS = 1800
+POLL_ONLINE_SECONDS = 300
+POLL_DRIVING_SECONDS = 10
+POLL_CHARGING_SECONDS = 60
+POLL_ERROR_SECONDS = 300
+
+WINDOW_SIZE_MINUTES = 3.0
+THRESHOLD_EFFICIENCY = 4.5
+LOW_EFFICIENCY_ALERT_COOLDOWN = 60
+
+REQUEST_TIMEOUT = 25
+EXTERNAL_DRIVE_BOOST_SECONDS = 180
+
+MORNING_ALERT_HOUR = 6
+MORNING_ALERT_MINUTE = 30
+
+
+def init_runtime_config(config_file: Path) -> None:
+    global PUBLIC_CONFIG
+    global POLL_ASLEEP_SECONDS, POLL_ONLINE_SECONDS, POLL_DRIVING_SECONDS
+    global POLL_CHARGING_SECONDS, POLL_ERROR_SECONDS
+    global WINDOW_SIZE_MINUTES, THRESHOLD_EFFICIENCY, LOW_EFFICIENCY_ALERT_COOLDOWN
+    global REQUEST_TIMEOUT, EXTERNAL_DRIVE_BOOST_SECONDS
+    global MORNING_ALERT_HOUR, MORNING_ALERT_MINUTE
+
+    PUBLIC_CONFIG = load_public_config(config_file)
+
+    POLL_ASLEEP_SECONDS = cfg_int(
+        PUBLIC_CONFIG, "polling", "asleep_seconds", "LIGHT_LOGGG_POLL_ASLEEP_SECONDS", 1800
+    )
+    POLL_ONLINE_SECONDS = cfg_int(
+        PUBLIC_CONFIG, "polling", "online_seconds", "LIGHT_LOGGG_POLL_ONLINE_SECONDS", 300
+    )
+    POLL_DRIVING_SECONDS = cfg_int(
+        PUBLIC_CONFIG, "polling", "driving_seconds", "LIGHT_LOGGG_POLL_DRIVING_SECONDS", 10
+    )
+    POLL_CHARGING_SECONDS = cfg_int(
+        PUBLIC_CONFIG, "polling", "charging_seconds", "LIGHT_LOGGG_POLL_CHARGING_SECONDS", 60
+    )
+    POLL_ERROR_SECONDS = cfg_int(
+        PUBLIC_CONFIG, "polling", "error_seconds", "LIGHT_LOGGG_POLL_ERROR_SECONDS", 300
+    )
+
+    WINDOW_SIZE_MINUTES = cfg_float(
+        PUBLIC_CONFIG, "alerts", "window_minutes", "LIGHT_LOGGG_WINDOW_MINUTES", 3.0
+    )
+    THRESHOLD_EFFICIENCY = cfg_float(
+        PUBLIC_CONFIG, "alerts", "threshold_km_per_kwh", "LIGHT_LOGGG_THRESHOLD_KM_PER_KWH", 4.5
+    )
+    LOW_EFFICIENCY_ALERT_COOLDOWN = cfg_int(
+        PUBLIC_CONFIG, "alerts", "alert_cooldown_seconds", "LIGHT_LOGGG_ALERT_COOLDOWN_SECONDS", 60
+    )
+
+    REQUEST_TIMEOUT = cfg_int(
+        PUBLIC_CONFIG, "request", "timeout_seconds", "LIGHT_LOGGG_REQUEST_TIMEOUT", 25
+    )
+
+    EXTERNAL_DRIVE_BOOST_SECONDS = cfg_int(
+        PUBLIC_CONFIG, "external_commands", "drive_boost_seconds", "LIGHT_LOGGG_EXTERNAL_DRIVE_BOOST_SECONDS", 180
+    )
+
+    MORNING_ALERT_HOUR = cfg_int(
+        PUBLIC_CONFIG, "morning_alert", "hour", "LIGHT_LOGGG_MORNING_ALERT_HOUR", 6
+    )
+    MORNING_ALERT_MINUTE = cfg_int(
+        PUBLIC_CONFIG, "morning_alert", "minute", "LIGHT_LOGGG_MORNING_ALERT_MINUTE", 30
+    )
+
+    print(
+        "runtime_config "
+        f"asleep={POLL_ASLEEP_SECONDS} "
+        f"online={POLL_ONLINE_SECONDS} "
+        f"driving={POLL_DRIVING_SECONDS} "
+        f"charging={POLL_CHARGING_SECONDS} "
+        f"error={POLL_ERROR_SECONDS} "
+        f"boost={EXTERNAL_DRIVE_BOOST_SECONDS} "
+        f"timeout={REQUEST_TIMEOUT}",
+        flush=True,
+    )
+
+
+# =========================
+# Utility functions
+# =========================
 
 def now_kst() -> datetime:
     return datetime.now(KST)
@@ -270,7 +430,6 @@ class DriveSession:
         if dt > 0:
             self.time_seconds += dt
 
-            # 주행거리: odometer가 있으면 odometer 차이를 우선, 아니면 speed 기반 추정
             if sample.odometer_km is not None and self.last_odometer_km is not None:
                 delta_odo = sample.odometer_km - self.last_odometer_km
                 if 0 <= delta_odo < 5:
@@ -278,8 +437,6 @@ class DriveSession:
             elif sample.speed_kmh is not None:
                 self.distance_km += sample.speed_kmh * dt / 3600.0
 
-            # 에너지: Tesla charge_state의 charger_power가 주행 중 power를 의미하지 않을 수도 있음.
-            # Fleet API vehicle_data에서 주행 전력 필드가 안정적으로 들어오지 않으면 0으로 남을 수 있음.
             if sample.power_kw is not None and sample.power_kw < 0:
                 self.energy_kwh += abs(sample.power_kw) * dt / 3600.0
 
@@ -553,7 +710,6 @@ class TeslaFleetClient:
         status = target.get("state") or "offline"
 
         # 핵심: asleep/offline이면 vehicle_data 호출 안 함.
-        # 이 호출이 차를 깨울 가능성을 줄이기 위함.
         if status != "online":
             return status, None
 
@@ -727,15 +883,6 @@ class LightLogggPoller:
     # -------------------------
 
     def read_command(self) -> Optional[Dict[str, Any]]:
-        """
-        Read and remove command file.
-
-        Supported examples:
-        {"command": "poll_now"}
-        {"command": "driving_start"}
-        {"command": "driving_stop"}
-        {"command": "clear_boost"}
-        """
         if not self.command_file.exists():
             return None
 
@@ -831,10 +978,6 @@ class LightLogggPoller:
 
         speed_mph = as_float(drive_state.get("speed"))
         odometer_miles = as_float(vehicle_state.get("odometer"))
-
-        # 주의:
-        # charge_state.charger_power는 충전 전력이다.
-        # 주행 중 전비 계산에는 한계가 있어서 charging 위주로만 신뢰하는 게 맞다.
         charger_power = as_float(charge_state.get("charger_power"))
 
         return Sample(
@@ -1013,6 +1156,13 @@ class LightLogggPoller:
             "vehicle_id": self.vehicle_id,
             "vehicle_name": self.vehicle_name,
             "external_drive_boost": self.should_boost_driving(),
+            "config": {
+                "asleep_seconds": POLL_ASLEEP_SECONDS,
+                "online_seconds": POLL_ONLINE_SECONDS,
+                "driving_seconds": POLL_DRIVING_SECONDS,
+                "charging_seconds": POLL_CHARGING_SECONDS,
+                "error_seconds": POLL_ERROR_SECONDS,
+            },
         }
 
         if vehicle:
@@ -1048,8 +1198,9 @@ class LightLogggPoller:
         self.restore_state()
         self.reset_daily_weekly_if_needed()
 
-        # restore_state 후에도 boost 값 유지
-        self.external_drive_boost_until = float(self.state.get("external_drive_boost_until") or self.external_drive_boost_until)
+        self.external_drive_boost_until = float(
+            self.state.get("external_drive_boost_until") or self.external_drive_boost_until
+        )
 
         self.handle_morning_alert(vehicle)
 
@@ -1180,6 +1331,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-file", default=str(DEFAULT_TOKEN_FILE), help="Tesla token JSON path")
     parser.add_argument("--state-file", default=str(DEFAULT_STATE_FILE), help="LIGHT LOGGG state JSON path")
     parser.add_argument("--command-file", default=str(DEFAULT_COMMAND_FILE), help="LIGHT LOGGG command JSON path")
+    parser.add_argument("--config-file", default=str(DEFAULT_PUBLIC_CONFIG_FILE), help="public config JSON path")
     parser.add_argument("--api-base", default=None, help="Tesla Fleet API base URL")
     parser.add_argument("--vin", default=None, help="target VIN when multiple vehicles exist")
     parser.add_argument("--no-env", action="store_true", help="do not load .env files")
@@ -1195,6 +1347,9 @@ def main() -> int:
 
     APP_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    config_file = Path(args.config_file).expanduser()
+    init_runtime_config(config_file)
 
     token_file = Path(args.token_file).expanduser()
     state_file = Path(args.state_file).expanduser()
