@@ -609,6 +609,28 @@ def start_polling_process() -> int:
     return process.pid
 
 
+def restart_bot_process_after_reply() -> None:
+    python_executable = shutil.which("python3") or shutil.which("python") or sys.executable
+
+    if not python_executable:
+        raise RuntimeError("python 실행 파일을 찾지 못함")
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    log_file = BOT_LOG_FILE.open("a", encoding="utf-8")
+
+    subprocess.Popen(
+        [python_executable, str(BOT_SCRIPT_PATH)],
+        cwd=str(APP_DIR),
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    time.sleep(1)
+    os._exit(0)
+
+
 def run_system_check() -> tuple[int, str]:
     if not CHECK_SCRIPT_PATH.exists():
         return 1, f"check_system.py 없음: {CHECK_SCRIPT_PATH}"
@@ -696,6 +718,8 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
             telegram_bot.send(chat_id, check_message)
 
         append_update_log("==== UPDATE END OK ====")
+
+        restart_bot_process_after_reply()
 
     except Exception as exc:
         append_update_log(f"UPDATE FAILED: {exc}")
