@@ -24,6 +24,7 @@ LIGHT LOGGG Tesla Fleet API polling handler.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -47,6 +48,8 @@ KST = timezone(timedelta(hours=9))
 
 APP_DIR = Path.home() / "light_loggg_tesla"
 LOG_DIR = APP_DIR / "logs"
+DATA_DIR = APP_DIR / "data"
+TRIPS_CSV_FILE = DATA_DIR / "trips.csv"
 
 DEFAULT_PUBLIC_CONFIG_FILE = APP_DIR / "light_loggg_public_config.json"
 DEFAULT_TOKEN_FILE = Path.home() / ".light_loggg_tesla_tokens.json"
@@ -406,6 +409,82 @@ def format_eta_clock(hours_value: Optional[float]) -> str:
     return eta.strftime("%H:%M")
 
 
+TRIP_CSV_FIELDS = [
+    "date",
+    "source",
+    "start_time",
+    "end_time",
+    "distance_km",
+    "duration_min",
+    "avg_speed_kmh",
+    "start_soc",
+    "end_soc",
+    "soc_used_pct",
+    "start_odometer_km",
+    "end_odometer_km",
+]
+
+
+def append_trip_csv(csv_file: Path, session: Dict[str, Any], source: str) -> None:
+    start_time = parse_dt(session.get("start_time"))
+    end_time = parse_dt(session.get("end_time"))
+
+    if end_time:
+        end_kst = end_time.astimezone(KST)
+        date_text = end_kst.date().isoformat()
+        end_time_text = end_kst.isoformat()
+    else:
+        date_text = now_kst().date().isoformat()
+        end_time_text = ""
+
+    if start_time:
+        start_time_text = start_time.astimezone(KST).isoformat()
+    else:
+        start_time_text = ""
+
+    distance_km = as_float(session.get("distance_km"))
+    time_seconds = as_float(session.get("time_seconds"))
+    avg_speed_kmh = as_float(session.get("avg_speed_kmh"))
+
+    start_soc = as_float(session.get("start_soc"))
+    end_soc = as_float(session.get("end_soc"))
+
+    if start_soc is not None and end_soc is not None:
+        soc_used_pct = start_soc - end_soc
+    else:
+        soc_used_pct = None
+
+    start_odometer_km = as_float(session.get("start_odometer_km"))
+    end_odometer_km = as_float(session.get("end_odometer_km"))
+
+    row = {
+        "date": date_text,
+        "source": source,
+        "start_time": start_time_text,
+        "end_time": end_time_text,
+        "distance_km": round(distance_km, 3) if distance_km is not None else "",
+        "duration_min": round(time_seconds / 60, 1) if time_seconds is not None else "",
+        "avg_speed_kmh": round(avg_speed_kmh, 1) if avg_speed_kmh is not None else "",
+        "start_soc": round(start_soc, 1) if start_soc is not None else "",
+        "end_soc": round(end_soc, 1) if end_soc is not None else "",
+        "soc_used_pct": round(soc_used_pct, 1) if soc_used_pct is not None else "",
+        "start_odometer_km": round(start_odometer_km, 3) if start_odometer_km is not None else "",
+        "end_odometer_km": round(end_odometer_km, 3) if end_odometer_km is not None else "",
+    }
+
+    csv_file.parent.mkdir(parents=True, exist_ok=True)
+
+    write_header = not csv_file.exists() or csv_file.stat().st_size == 0
+
+    with csv_file.open("a", encoding="utf-8-sig", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=TRIP_CSV_FIELDS)
+
+        if write_header:
+            writer.writeheader()
+
+        writer.writerow(row)
+
+
 # =========================
 # Data classes
 # =========================
@@ -437,8 +516,6 @@ class DriveSession:
     energy_kwh: float = 0.0
     speeds: List[float] = field(default_factory=list)
     efficiencies: List[float] = field(default_factory=list)
-    accel_count: int = 0
-    decel_count: int = 0
 
     def start(self, sample: Sample) -> None:
         self.active = True
@@ -1494,6 +1571,7 @@ class LightLogggPoller:
 
             if external_session:
                 self.update_daily_weekly_after_drive(external_session)
+                append_trip_csv(TRIPS_CSV_FILE, external_session, source="external_bt")
                 self.send_drive_end_summary(external_session)
 
             # 내부 주행 세션은 외부 BT 기준 종료가 들어왔으므로 정리한다.
@@ -1523,11 +1601,7 @@ class LightLogggPoller:
                 session = self.drive.end(sample)
                 self.state["last_drive_end_soc"] = sample.battery_level
                 self.update_daily_weekly_after_drive(session)
-
-            if was_driving:
-                session = self.drive.end(sample)
-                self.state["last_drive_end_soc"] = sample.battery_level
-                self.update_daily_weekly_after_drive(session)
+                append_trip_csv(TRIPS_CSV_FILE, session, source="internal_polling")
 
             if charging:
                 interval = POLL_CHARGING_SECONDS
