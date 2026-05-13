@@ -84,8 +84,8 @@ DEFAULT_PUBLIC_CONFIG: Dict[str, Any] = {
     "polling": {
         "asleep_seconds": 1800,
         "online_seconds": 300,
-        "driving_seconds": 10,
-        "charging_seconds": 60,
+        "driving_seconds": 300,
+        "charging_seconds": 300,
         "error_seconds": 300,
     },
     "alerts": {
@@ -103,16 +103,14 @@ DEFAULT_PUBLIC_CONFIG: Dict[str, Any] = {
         "hour": 6,
         "minute": 30,
     },
-}
-
-
     "daily_report": {
         "enabled": True,
         "hour": 19,
         "minute": 0,
         "weekly_enabled": True,
-        "weekly_day": 4
+        "weekly_day": 4,
     },
+}
 
 
 # =========================
@@ -293,7 +291,8 @@ def init_runtime_config(config_file: Path) -> None:
     MORNING_ALERT_MINUTE = cfg_int(
         PUBLIC_CONFIG, "morning_alert", "minute", "LIGHT_LOGGG_MORNING_ALERT_MINUTE", 30
     )
-        DAILY_REPORT_ENABLED = cfg_bool(
+
+    DAILY_REPORT_ENABLED = cfg_bool(
         PUBLIC_CONFIG, "daily_report", "enabled", "LIGHT_LOGGG_DAILY_REPORT_ENABLED", True
     )
     DAILY_REPORT_HOUR = cfg_int(
