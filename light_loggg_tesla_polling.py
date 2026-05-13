@@ -453,8 +453,6 @@ class DriveSession:
         self.energy_kwh = 0.0
         self.speeds = []
         self.efficiencies = []
-        self.accel_count = 0
-        self.decel_count = 0
 
     def add_sample(self, sample: Sample) -> None:
         if not self.active:
@@ -480,16 +478,6 @@ class DriveSession:
 
         if sample.speed_kmh is not None:
             self.speeds.append(sample.speed_kmh)
-
-            if self.last_speed_kmh is not None and dt > 0:
-                delta_speed = sample.speed_kmh - self.last_speed_kmh
-                accel_kmh_per_s = delta_speed / dt
-
-                if accel_kmh_per_s >= 8:
-                    self.accel_count += 1
-                elif accel_kmh_per_s <= -10:
-                    self.decel_count += 1
-
             self.last_speed_kmh = sample.speed_kmh
 
         if self.distance_km > 0 and self.energy_kwh > 0:
@@ -519,8 +507,6 @@ class DriveSession:
             "avg_efficiency_km_per_kwh": round(avg_eff, 2),
             "start_soc": self.start_soc,
             "end_soc": sample.battery_level,
-            "accel_count": self.accel_count,
-            "decel_count": self.decel_count,
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -535,8 +521,6 @@ class DriveSession:
             "distance_km": self.distance_km,
             "time_seconds": self.time_seconds,
             "energy_kwh": self.energy_kwh,
-            "accel_count": self.accel_count,
-            "decel_count": self.decel_count,
         }
 
     @classmethod
@@ -552,8 +536,6 @@ class DriveSession:
         drive.distance_km = float(data.get("distance_km") or 0.0)
         drive.time_seconds = float(data.get("time_seconds") or 0.0)
         drive.energy_kwh = float(data.get("energy_kwh") or 0.0)
-        drive.accel_count = int(data.get("accel_count") or 0)
-        drive.decel_count = int(data.get("decel_count") or 0)
         return drive
 
 
@@ -825,8 +807,6 @@ class LightLogggPoller:
                 "drive_sessions": [],
                 "efficiencies": [],
                 "speed_samples": [],
-                "accel_count": 0,
-                "decel_count": 0,
                 "start_soc": None,
                 "end_soc": None,
             },
@@ -913,8 +893,6 @@ class LightLogggPoller:
                 "drive_sessions": [],
                 "efficiencies": [],
                 "speed_samples": [],
-                "accel_count": 0,
-                "decel_count": 0,
                 "start_soc": None,
                 "end_soc": None,
             }
@@ -1055,8 +1033,6 @@ class LightLogggPoller:
             "avg_efficiency_km_per_kwh": 0.0,
             "start_soc": start_soc,
             "end_soc": end_soc,
-            "accel_count": 0,
-            "decel_count": 0,
         }
 
         self.state["external_drive_session"] = {
@@ -1360,8 +1336,6 @@ class LightLogggPoller:
         daily["total_distance_km"] = float(daily.get("total_distance_km") or 0.0) + distance
         daily["total_time_seconds"] = float(daily.get("total_time_seconds") or 0.0) + seconds
         daily["total_energy_kwh"] = float(daily.get("total_energy_kwh") or 0.0) + energy
-        daily["accel_count"] = int(daily.get("accel_count") or 0) + int(session.get("accel_count") or 0)
-        daily["decel_count"] = int(daily.get("decel_count") or 0) + int(session.get("decel_count") or 0)
         daily["end_soc"] = session.get("end_soc")
 
         if daily.get("start_soc") is None:
