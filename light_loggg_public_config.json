@@ -2,8 +2,8 @@
   "polling": {
     "asleep_seconds": 1800,
     "online_seconds": 300,
-    "driving_seconds": 10,
-    "charging_seconds": 60,
+    "driving_seconds": 300,
+    "charging_seconds": 300,
     "error_seconds": 300
   },
   "alerts": {
@@ -16,5 +16,9 @@
   },
   "request": {
     "timeout_seconds": 25
+  },
+  "morning_alert": {
+    "hour": 6,
+    "minute": 30
   }
 }
