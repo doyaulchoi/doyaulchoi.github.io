@@ -476,8 +476,8 @@ class DriveSession:
             elif sample.speed_kmh is not None:
                 self.distance_km += sample.speed_kmh * dt / 3600.0
 
-            if sample.power_kw is not None and sample.power_kw < 0:
-                self.energy_kwh += abs(sample.power_kw) * dt / 3600.0
+            if sample.power_kw is not None and sample.power_kw > 0:
+                self.energy_kwh += sample.power_kw * dt / 3600.0
 
         if sample.speed_kmh is not None:
             self.speeds.append(sample.speed_kmh)
@@ -1023,12 +1023,14 @@ class LightLogggPoller:
 
         speed_mph = as_float(drive_state.get("speed"))
         odometer_miles = as_float(vehicle_state.get("odometer"))
+        drive_power = as_float(drive_state.get("power"))
         charger_power = as_float(charge_state.get("charger_power"))
+        power_kw = drive_power if drive_power is not None else charger_power
 
         return Sample(
             time=now_kst(),
             speed_kmh=speed_mph_to_kmh(speed_mph),
-            power_kw=charger_power,
+            power_kw=power_kw,
             odometer_km=miles_to_km(odometer_miles),
             battery_level=as_float(charge_state.get("battery_level")),
             latitude=as_float(drive_state.get("latitude")),
@@ -1426,13 +1428,31 @@ class LightLogggPoller:
                 self.state["last_drive_end_soc"] = sample.battery_level
                 self.update_daily_weekly_after_drive(session)
 
-                if session.get("distance_km", 0) > 0:
+                distance_km = float(session.get("distance_km") or 0.0)
+
+                if distance_km >= 1.0:
+                    energy_kwh = float(session.get("energy_kwh") or 0.0)
+                    avg_eff = float(session.get("avg_efficiency_km_per_kwh") or 0.0)
+                    avg_speed = float(session.get("avg_speed_kmh") or 0.0)
+
+                    start_soc = session.get("start_soc")
+                    end_soc = session.get("end_soc")
+
+                    if isinstance(start_soc, (int, float)) and isinstance(end_soc, (int, float)):
+                        battery_text = f"{start_soc:.0f}% → {end_soc:.0f}% ({start_soc - end_soc:.0f}%p 사용)"
+                    else:
+                        battery_text = f"{start_soc or '-'}% → {end_soc or '-'}%"
+
+                    energy_text = f"{energy_kwh:.2f} kWh" if energy_kwh > 0 else "확인 불가"
+                    eff_text = f"{avg_eff:.2f} km/kWh" if avg_eff > 0 else "확인 불가"
+
                     self.telegram.send(
-                        "주행 종료\n"
-                        f"- 거리: {session.get('distance_km', 0):.2f} km\n"
-                        f"- 시간: {float(session.get('time_seconds') or 0) / 60:.0f}분\n"
-                        f"- 평균속도: {session.get('avg_speed_kmh', 0):.1f} km/h\n"
-                        f"- 배터리: {session.get('start_soc') or '-'}% -> {session.get('end_soc') or '-'}%"
+                        "두삼이 주행 종료\n"
+                        f"- 주행거리: {distance_km:.2f} km\n"
+                        f"- 배터리: {battery_text}\n"
+                        f"- 소모량: {energy_text}\n"
+                        f"- 평균속도: {avg_speed:.1f} km/h\n"
+                        f"- 주행 전비: {eff_text}"
                     )
 
             if charging:
