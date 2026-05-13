@@ -1,17 +1,19 @@
+cat > ~/light_loggg_tesla/light_loggg_command_server.py <<'PY'
 #!/usr/bin/env python3
 """
-LIGHT LOGGG command server.
+LIGHT LOGGG local HTTP command server.
 
-목표:
-- 세컨폰/Tasker/Tailscale에서 HTTP 요청으로 주행 시작/종료 신호 전송
-- polling 프로세스가 읽는 command.json 생성
-- 별도 외부 패키지 없이 Python 표준 라이브러리만 사용
+목적:
+- Tailscale / 같은 LAN / 로컬 Termux에서 HTTP로 명령 수신
+- 수신한 명령을 ~/light_loggg_tesla/command.json 에 atomic write
+- polling 스크립트가 command.json을 읽고 즉시 처리
 
-기본 동작:
-- POST /drive/start  -> command.json에 driving_start 기록
-- POST /drive/stop   -> command.json에 driving_stop 기록
-- POST /poll_now     -> command.json에 poll_now 기록
-- GET  /health       -> 상태 확인
+지원 URL:
+- GET  /health
+- GET  /poll_now
+- GET  /driving_start
+- GET  /driving_stop
+- POST /command   {"command":"driving_start","seconds":180}
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from urllib.parse import parse_qs, urlparse
 
 
@@ -32,17 +34,17 @@ KST = timezone(timedelta(hours=9))
 
 APP_DIR = Path.home() / "light_loggg_tesla"
 LOG_DIR = APP_DIR / "logs"
-
 COMMAND_FILE = APP_DIR / "command.json"
 PID_FILE = APP_DIR / "command_server.pid"
 LOG_FILE = LOG_DIR / "command_server.log"
 
 DEFAULT_HOST = os.getenv("LIGHT_LOGGG_COMMAND_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("LIGHT_LOGGG_COMMAND_PORT", "8787"))
+DEFAULT_DRIVE_BOOST_SECONDS = int(os.getenv("LIGHT_LOGGG_EXTERNAL_DRIVE_BOOST_SECONDS", "180"))
 
-# 비워두면 인증 없이 동작.
-# Tailscale 내부망에서만 쓸 거면 일단 비워둬도 된다.
-# 나중에 필요하면 ~/.light_loggg.env에 LIGHT_LOGGG_COMMAND_SECRET=원하는값 추가.
+# 비워두면 인증 없음.
+# Tailscale 내부에서만 쓸 거면 비워둬도 됨.
+# 외부망에 열 생각이면 ~/.light_loggg.env 에 LIGHT_LOGGG_COMMAND_SECRET=... 넣어라.
 COMMAND_SECRET = os.getenv("LIGHT_LOGGG_COMMAND_SECRET", "").strip()
 
 
@@ -50,11 +52,10 @@ def now_kst() -> datetime:
     return datetime.now(KST)
 
 
-def log(message: str) -> None:
+def log(text: str) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    line = f"[{now_kst().isoformat()}] {message}"
-
+    line = f"[{now_kst().isoformat()}] {text}"
     print(line, flush=True)
 
     try:
@@ -75,39 +76,53 @@ def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def parse_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
-    content_length = int(handler.headers.get("Content-Length") or 0)
+def json_bytes(payload: Dict[str, Any]) -> bytes:
+    return (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
 
-    if content_length <= 0:
-        return {}
 
-    raw = handler.rfile.read(content_length)
-
-    if not raw:
-        return {}
-
+def safe_int(value: Any, default: int) -> int:
     try:
-        data = json.loads(raw.decode("utf-8"))
-        if isinstance(data, dict):
-            return data
+        result = int(value)
+        if result <= 0:
+            return default
+        return result
     except Exception:
-        return {}
-
-    return {}
+        return default
 
 
-def write_command(command_name: str, source: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def normalize_command(command: str) -> str:
+    command = (command or "").strip().lower().lstrip("/")
+
+    aliases = {
+        "wake_poll": "poll_now",
+        "refresh": "poll_now",
+        "drive_start": "driving_start",
+        "start_driving": "driving_start",
+        "drive_stop": "driving_stop",
+        "stop_driving": "driving_stop",
+        "clear_boost": "driving_stop",
+    }
+
+    return aliases.get(command, command)
+
+
+def build_command(command: str, source: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    params = params or {}
+    command = normalize_command(command)
+
+    if command not in {"poll_now", "driving_start", "driving_stop"}:
+        raise ValueError(f"unsupported command: {command}")
+
     payload: Dict[str, Any] = {
-        "command": command_name,
+        "command": command,
         "source": source,
         "time": now_kst().isoformat(),
     }
 
-    if extra:
-        payload.update(extra)
-
-    atomic_write_json(COMMAND_FILE, payload)
-    log(f"command written: {payload}")
+    if command == "driving_start":
+        payload["seconds"] = safe_int(params.get("seconds"), DEFAULT_DRIVE_BOOST_SECONDS)
 
     return payload
 
@@ -118,30 +133,73 @@ class CommandHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         log(f"{self.client_address[0]} {fmt % args}")
 
-    def send_json(self, status_code: int, payload: Dict[str, Any]) -> None:
-        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    def send_json(self, status: int, payload: Dict[str, Any]) -> None:
+        body = json_bytes(payload)
 
-        self.send_response(status_code)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def authorized(self, query: Dict[str, list[str]], body: Dict[str, Any]) -> bool:
+    def unauthorized(self) -> None:
+        self.send_json(
+            401,
+            {
+                "ok": False,
+                "error": "unauthorized",
+            },
+        )
+
+    def check_secret(self, query: Dict[str, list[str]], body: Dict[str, Any] | None = None) -> bool:
         if not COMMAND_SECRET:
             return True
 
         header_secret = self.headers.get("X-Light-Loggg-Secret", "").strip()
         query_secret = (query.get("secret") or [""])[0].strip()
-        body_secret = str(body.get("secret") or "").strip()
+        body_secret = ""
+
+        if isinstance(body, dict):
+            body_secret = str(body.get("secret") or "").strip()
 
         return COMMAND_SECRET in {header_secret, query_secret, body_secret}
 
+    def handle_command(self, command: str, params: Dict[str, Any] | None = None) -> None:
+        try:
+            payload = build_command(command, source="http", params=params)
+            atomic_write_json(COMMAND_FILE, payload)
+
+            log(f"command written: {payload}")
+
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "command_file": str(COMMAND_FILE),
+                    "command": payload,
+                },
+            )
+
+        except Exception as exc:
+            log(f"command failed: {exc}")
+            self.send_json(
+                400,
+                {
+                    "ok": False,
+                    "error": str(exc),
+                },
+            )
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        path = parsed.path
+        path = parsed.path.strip("/")
+        query = parse_qs(parsed.query)
 
-        if path == "/health":
+        if not self.check_secret(query):
+            self.unauthorized()
+            return
+
+        if path in {"", "health"}:
             self.send_json(
                 200,
                 {
@@ -149,9 +207,45 @@ class CommandHandler(BaseHTTPRequestHandler):
                     "service": "light_loggg_command_server",
                     "time": now_kst().isoformat(),
                     "command_file": str(COMMAND_FILE),
-                    "auth_enabled": bool(COMMAND_SECRET),
+                    "supported": [
+                        "/health",
+                        "/poll_now",
+                        "/driving_start",
+                        "/driving_stop",
+                        "/command?name=driving_start",
+                    ],
                 },
             )
+            return
+
+        if path == "command":
+            command = (query.get("name") or query.get("command") or [""])[0]
+            params: Dict[str, Any] = {}
+
+            if query.get("seconds"):
+                params["seconds"] = query["seconds"][0]
+
+            self.handle_command(command, params=params)
+            return
+
+        if path in {
+            "poll_now",
+            "driving_start",
+            "driving_stop",
+            "wake_poll",
+            "refresh",
+            "drive_start",
+            "start_driving",
+            "drive_stop",
+            "stop_driving",
+            "clear_boost",
+        }:
+            params = {}
+
+            if query.get("seconds"):
+                params["seconds"] = query["seconds"][0]
+
+            self.handle_command(path, params=params)
             return
 
         self.send_json(
@@ -159,157 +253,82 @@ class CommandHandler(BaseHTTPRequestHandler):
             {
                 "ok": False,
                 "error": "not found",
-                "path": path,
+                "path": parsed.path,
             },
         )
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        path = parsed.path
+        path = parsed.path.strip("/")
         query = parse_qs(parsed.query)
-        body = parse_json_body(self)
 
-        if not self.authorized(query, body):
-            self.send_json(
-                401,
-                {
-                    "ok": False,
-                    "error": "unauthorized",
-                },
-            )
-            return
-
-        source = str(body.get("source") or "http").strip() or "http"
+        length = safe_int(self.headers.get("Content-Length"), 0)
+        raw_body = self.rfile.read(length) if length > 0 else b"{}"
 
         try:
-            if path in {"/drive/start", "/driving_start"}:
-                seconds = body.get("seconds")
+            body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+            if not isinstance(body, dict):
+                body = {}
+        except Exception:
+            body = {}
 
-                try:
-                    seconds_int = int(seconds) if seconds is not None else 180
-                except Exception:
-                    seconds_int = 180
+        if not self.check_secret(query, body):
+            self.unauthorized()
+            return
 
-                if seconds_int <= 0:
-                    seconds_int = 180
+        if path == "command":
+            command = str(body.get("command") or body.get("name") or "")
+            self.handle_command(command, params=body)
+            return
 
-                command = write_command(
-                    "driving_start",
-                    source=source,
-                    extra={
-                        "seconds": seconds_int,
-                        "client": self.client_address[0],
-                    },
-                )
+        if path in {"poll_now", "driving_start", "driving_stop"}:
+            self.handle_command(path, params=body)
+            return
 
-                self.send_json(
-                    200,
-                    {
-                        "ok": True,
-                        "message": "driving_start written",
-                        "command": command,
-                    },
-                )
-                return
-
-            if path in {"/drive/stop", "/driving_stop"}:
-                command = write_command(
-                    "driving_stop",
-                    source=source,
-                    extra={
-                        "client": self.client_address[0],
-                    },
-                )
-
-                self.send_json(
-                    200,
-                    {
-                        "ok": True,
-                        "message": "driving_stop written",
-                        "command": command,
-                    },
-                )
-                return
-
-            if path in {"/poll_now", "/poll"}:
-                command = write_command(
-                    "poll_now",
-                    source=source,
-                    extra={
-                        "client": self.client_address[0],
-                    },
-                )
-
-                self.send_json(
-                    200,
-                    {
-                        "ok": True,
-                        "message": "poll_now written",
-                        "command": command,
-                    },
-                )
-                return
-
-            self.send_json(
-                404,
-                {
-                    "ok": False,
-                    "error": "not found",
-                    "path": path,
-                },
-            )
-
-        except Exception as exc:
-            log(f"request failed: {exc}")
-            self.send_json(
-                500,
-                {
-                    "ok": False,
-                    "error": str(exc),
-                },
-            )
-
-
-def write_pid() -> None:
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()) + "\n", encoding="utf-8")
+        self.send_json(
+            404,
+            {
+                "ok": False,
+                "error": "not found",
+                "path": parsed.path,
+            },
+        )
 
 
 def run_server(host: str, port: int) -> None:
-    write_pid()
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    PID_FILE.write_text(str(os.getpid()) + "\n", encoding="utf-8")
 
     server = ThreadingHTTPServer((host, port), CommandHandler)
 
     log(f"command server started host={host} port={port} pid={os.getpid()}")
 
     try:
-        server.serve_forever(poll_interval=1.0)
-    except KeyboardInterrupt:
-        log("command server interrupted")
+        server.serve_forever(poll_interval=0.5)
     finally:
-        server.server_close()
-        PID_FILE.unlink(missing_ok=True)
         log("command server stopped")
+        server.server_close()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="LIGHT LOGGG command server")
-    parser.add_argument("--host", default=DEFAULT_HOST, help="bind host")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="bind port")
-    parser.add_argument("--daemon", action="store_true", help="accepted for compatibility; foreground process is started by caller")
+    parser = argparse.ArgumentParser(description="LIGHT LOGGG HTTP command server")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--daemon", action="store_true", help="accepted for nohup/system compatibility")
     return parser
 
 
 def main() -> int:
     args = build_arg_parser().parse_args()
-
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
     run_server(args.host, args.port)
-
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+PY
+
+chmod +x ~/light_loggg_tesla/light_loggg_command_server.py
+python -m py_compile ~/light_loggg_tesla/light_loggg_command_server.py
