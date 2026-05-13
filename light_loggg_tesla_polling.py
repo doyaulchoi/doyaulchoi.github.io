@@ -64,7 +64,6 @@ VEHICLE_DATA_ENDPOINT_LIST = [
     "closures_state",
     "drive_state",
     "gui_settings",
-    "location_data",
     "vehicle_config",
     "vehicle_state",
     "vehicle_data_combo",
@@ -76,7 +75,7 @@ VEHICLE_DATA_ENDPOINTS_WITHOUT_LOCATION = ";".join(
     endpoint for endpoint in VEHICLE_DATA_ENDPOINT_LIST if endpoint != "location_data"
 )
 
-DEFAULT_TESLA_SCOPE = "openid offline_access user_data vehicle_device_data vehicle_location"
+DEFAULT_TESLA_SCOPE = "openid offline_access user_data vehicle_device_data"
 
 DEFAULT_PUBLIC_CONFIG: Dict[str, Any] = {
     "polling": {
@@ -1033,8 +1032,8 @@ class LightLogggPoller:
             power_kw=power_kw,
             odometer_km=miles_to_km(odometer_miles),
             battery_level=as_float(charge_state.get("battery_level")),
-            latitude=as_float(drive_state.get("latitude")),
-            longitude=as_float(drive_state.get("longitude")),
+            latitude=None,
+            longitude=None,
             shift_state=drive_state.get("shift_state"),
             charging_state=charge_state.get("charging_state"),
         )
@@ -1358,8 +1357,6 @@ class LightLogggPoller:
             payload.update(
                 {
                     "speed_kmh": round(sample.speed_kmh, 1) if sample.speed_kmh is not None else None,
-                    "latitude": sample.latitude,
-                    "longitude": sample.longitude,
                 }
             )
 
