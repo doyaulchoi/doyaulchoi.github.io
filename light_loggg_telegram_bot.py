@@ -54,12 +54,14 @@ UPDATE_FILES = [
     "light_loggg_telegram_bot.py",
     "light_loggg_tesla_oauth.py",
     "check_system.py",
+    "start-light-loggg.sh",
     "setup_light_loggg_tesla_polling.sh",
     "setup_tesla_telemetry.sh",
     "setup_tesla_telemetry_python.sh",
     "telemetry_server.py",
     "tesla_telemetry_handler.py",
 ]
+
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
