@@ -7,6 +7,7 @@ and /update.
 Operational policy:
 - GitHub is the source of truth.
 - Termux updates are performed by downloading raw files from GitHub.
+- Public config is stored in ~/light_loggg_tesla/light_loggg_public_config.json.
 - Sensitive values must stay in ~/.light_loggg.env or local token files.
 """
 
@@ -42,6 +43,8 @@ DEFAULT_STATE_FILE = Path.home() / ".light_loggg_state.json"
 DEFAULT_PID_FILE = APP_DIR / "polling.pid"
 BOT_PID_FILE = APP_DIR / "telegram_bot.pid"
 
+PUBLIC_CONFIG_FILE = APP_DIR / "light_loggg_public_config.json"
+
 DEFAULT_LOG_FILE = LOG_DIR / "polling.log"
 BOT_LOG_FILE = LOG_DIR / "telegram_bot.log"
 UPDATE_LOG_FILE = LOG_DIR / "update.log"
@@ -56,6 +59,7 @@ BOOT_TARGET_FILE = BOOT_TARGET_DIR / "start-light-loggg.sh"
 COMMAND_FILE = APP_DIR / "command.json"
 
 UPDATE_FILES = [
+    "light_loggg_public_config.json",
     "light_loggg_tesla_polling.py",
     "light_loggg_telegram_bot.py",
     "light_loggg_tesla_oauth.py",
@@ -183,6 +187,41 @@ def tail_log(log_file: Path = DEFAULT_LOG_FILE, lines: int = 5) -> str:
         return "로그 확인 실패"
 
 
+def format_config_status(state: Dict[str, Any]) -> list[str]:
+    last = state.get("last_poll") or {}
+    config = last.get("config") or {}
+
+    if not isinstance(config, dict) or not config:
+        public_config = load_json(PUBLIC_CONFIG_FILE, {})
+        polling = public_config.get("polling") or {}
+
+        if isinstance(polling, dict) and polling:
+            return [
+                "설정:",
+                f"- source: public_config 추정",
+                f"- asleep: {polling.get('asleep_seconds', '-')}",
+                f"- online: {polling.get('online_seconds', '-')}",
+                f"- driving: {polling.get('driving_seconds', '-')}",
+                f"- charging: {polling.get('charging_seconds', '-')}",
+                f"- error: {polling.get('error_seconds', '-')}",
+            ]
+
+        return [
+            "설정:",
+            "- polling config 기록 없음",
+        ]
+
+    return [
+        "설정:",
+        "- source: last_poll",
+        f"- asleep: {config.get('asleep_seconds', '-')}",
+        f"- online: {config.get('online_seconds', '-')}",
+        f"- driving: {config.get('driving_seconds', '-')}",
+        f"- charging: {config.get('charging_seconds', '-')}",
+        f"- error: {config.get('error_seconds', '-')}",
+    ]
+
+
 def format_daily_summary(state: Dict[str, Any]) -> str:
     daily = state.get("daily") or {}
 
@@ -266,6 +305,8 @@ def format_status(state_file: Path) -> str:
     polling_pid = read_pid(DEFAULT_PID_FILE)
     bot_pid = read_pid(BOT_PID_FILE)
 
+    public_config_exists = PUBLIC_CONFIG_FILE.exists()
+
     lines = [
         "LIGHT LOGGG 상태",
         f"프로세스: {running_text}",
@@ -294,6 +335,10 @@ def format_status(state_file: Path) -> str:
 
     if bot_pid is not None:
         lines.append(f"bot PID: {bot_pid}")
+
+    lines.append(f"공개 설정 파일: {'있음' if public_config_exists else '없음'}")
+
+    lines.extend(format_config_status(state))
 
     lines.append("최근 로그:")
     lines.append(tail_log())
@@ -381,6 +426,26 @@ def py_compile_file(path: Path) -> None:
         raise RuntimeError(f"{path.name} 문법 검사 실패: {result.stderr or result.stdout}")
 
 
+def validate_public_config() -> str:
+    if not PUBLIC_CONFIG_FILE.exists():
+        return "public config 없음"
+
+    try:
+        data = json.loads(PUBLIC_CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"public config JSON 오류: {exc}")
+
+    if not isinstance(data, dict):
+        raise RuntimeError("public config 최상위가 object가 아님")
+
+    polling = data.get("polling") or {}
+
+    if not isinstance(polling, dict):
+        raise RuntimeError("public config polling 항목이 object가 아님")
+
+    return "public config 검증 완료"
+
+
 def install_boot_script() -> str:
     if not BOOT_SOURCE_FILE.exists():
         return "boot script 원본 없음. 설치 생략."
@@ -463,7 +528,9 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
         for filename in UPDATE_FILES:
             download_file(filename)
 
-        telegram_bot.send(chat_id, "GitHub raw 파일 다운로드 완료. 문법 검사를 시작합니다.")
+        telegram_bot.send(chat_id, "GitHub raw 파일 다운로드 완료. 검사를 시작합니다.")
+
+        config_msg = validate_public_config()
 
         py_compile_file(POLLING_SCRIPT_PATH)
         py_compile_file(BOT_SCRIPT_PATH)
@@ -489,6 +556,7 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
         telegram_bot.send(
             chat_id,
             "업데이트 완료\n"
+            f"- {config_msg}\n"
             f"- {boot_msg}\n"
             f"- {stop_msg}\n"
             f"- 새 polling PID: {new_pid}\n"
