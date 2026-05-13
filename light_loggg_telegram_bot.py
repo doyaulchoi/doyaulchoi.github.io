@@ -50,6 +50,7 @@ LOG_DIR = APP_DIR / "logs"
 DEFAULT_STATE_FILE = Path.home() / ".light_loggg_state.json"
 DEFAULT_PID_FILE = APP_DIR / "polling.pid"
 BOT_PID_FILE = APP_DIR / "telegram_bot.pid"
+BOT_OFFSET_FILE = APP_DIR / "telegram_bot_offset.json"
 
 PUBLIC_CONFIG_FILE = APP_DIR / "light_loggg_public_config.json"
 
@@ -227,6 +228,28 @@ def extract_fail_lines(text: str) -> list[str]:
             lines.append(stripped)
 
     return lines
+
+
+def load_bot_offset() -> int:
+    data = load_json(BOT_OFFSET_FILE, {})
+
+    try:
+        return int(data.get("offset") or 0)
+    except Exception:
+        return 0
+
+
+def save_bot_offset(offset: int) -> None:
+    try:
+        atomic_write_json(
+            BOT_OFFSET_FILE,
+            {
+                "offset": int(offset),
+                "saved_at": now_kst().isoformat(),
+            },
+        )
+    except Exception as exc:
+        print(f"Failed to save bot offset: {exc}", file=sys.stderr, flush=True)
 
 
 def format_config_status(state: Dict[str, Any]) -> list[str]:
@@ -750,10 +773,55 @@ class TelegramBot:
         self.token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
         self.chat_id = os.getenv("TELEGRAM_CHAT_ID")
         self.state_file = state_file
-        self.offset = 0
 
         if not self.token:
             raise RuntimeError("TELEGRAM_BOT_TOKEN 또는 TELEGRAM_TOKEN 환경변수가 필요합니다.")
+
+        self.offset = load_bot_offset()
+        if self.offset <= 0:
+            self.offset = self.bootstrap_offset()
+
+    def bootstrap_offset(self) -> int:
+        """첫 실행/offset 파일 없음 상태에서 기존 pending update를 버린다.
+
+        목적:
+        - /update 처리 후 bot 재시작 시 같은 /update를 다시 처리하는 루프 방지
+        - 새 bot 시작 시점 이전에 쌓여 있던 update는 처리하지 않음
+        """
+
+        url = f"https://api.telegram.org/bot{self.token}/getUpdates"
+
+        try:
+            response = requests.get(
+                url,
+                params={
+                    "timeout": 0,
+                    "limit": 100,
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            data = response.json()
+
+            if not data.get("ok"):
+                return 0
+
+            update_ids = [
+                int(update.get("update_id", 0))
+                for update in data.get("result", [])
+                if int(update.get("update_id", 0)) > 0
+            ]
+
+            if not update_ids:
+                return 0
+
+            latest = max(update_ids)
+            save_bot_offset(latest)
+            return latest
+
+        except Exception as exc:
+            print(f"bootstrap_offset failed: {exc}", file=sys.stderr, flush=True)
+            return 0
 
     def send(self, chat_id: str, text: str) -> None:
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
@@ -902,7 +970,9 @@ class TelegramBot:
                     continue
 
                 for update in data.get("result", []):
-                    self.offset = max(self.offset, int(update.get("update_id", 0)))
+                    update_id = int(update.get("update_id", 0))
+                    self.offset = max(self.offset, update_id)
+                    save_bot_offset(self.offset)
 
                     message = update.get("message") or {}
                     text = message.get("text") or ""
