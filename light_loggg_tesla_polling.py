@@ -367,6 +367,44 @@ def safe_int(value: Any, default: int = 0) -> int:
     except Exception:
         return default
 
+def format_duration_hours_minutes(hours_value: Optional[float]) -> str:
+    if hours_value is None or hours_value <= 0:
+        return "확인 불가"
+
+    total_minutes = int(round(hours_value * 60))
+
+    if total_minutes <= 0:
+        return "확인 불가"
+
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+
+    if hours > 0 and minutes > 0:
+        return f"{hours}시간 {minutes}분"
+
+    if hours > 0:
+        return f"{hours}시간"
+
+    return f"{minutes}분"
+
+
+def format_eta_clock(hours_value: Optional[float]) -> str:
+    if hours_value is None or hours_value <= 0:
+        return "확인 불가"
+
+    total_minutes = int(round(hours_value * 60))
+
+    if total_minutes <= 0:
+        return "확인 불가"
+
+    eta = now_kst() + timedelta(minutes=total_minutes)
+    day_delta = (eta.date() - now_kst().date()).days
+
+    if day_delta > 0:
+        return f"{eta.strftime('%H:%M')}(D+{day_delta})"
+
+    return eta.strftime("%H:%M")
+
 
 # =========================
 # Data classes
@@ -1038,7 +1076,7 @@ class LightLogggPoller:
             "powers": [],
         }
 
-    def handle_charging_notifications(self, vehicle: Dict[str, Any]) -> None:
+        def handle_charging_notifications(self, vehicle: Dict[str, Any]) -> None:
         charge_state = vehicle.get("charge_state") or {}
 
         battery_level = as_float(charge_state.get("battery_level"))
@@ -1054,7 +1092,12 @@ class LightLogggPoller:
 
         if self.charging_notification_stage == "idle":
             soc_text = f"{battery_level:.0f}%" if battery_level is not None else "확인 불가"
-            self.telegram.send(f"충전 시작\n- 현재 배터리: {soc_text}")
+
+            self.telegram.send(
+                "충전 시작\n"
+                f"- 현재 배터리: {soc_text}"
+            )
+
             self.charging_notification_stage = "initial_notified"
             self.charging_start_timestamp = now_kst()
             return
@@ -1069,20 +1112,20 @@ class LightLogggPoller:
             if elapsed >= 180:
                 soc_text = f"{battery_level:.0f}%" if battery_level is not None else "확인 불가"
                 kw_text = f"{charger_power:.1f} kW" if charger_power is not None else "확인 불가"
-
-                if time_to_full is not None:
-                    eta_text = f"{int(time_to_full * 60)}분"
-                else:
-                    eta_text = "확인 불가"
+                duration_text = format_duration_hours_minutes(time_to_full)
+                eta_clock_text = format_eta_clock(time_to_full)
 
                 self.telegram.send(
                     "충전 중 3분 경과\n"
                     f"- 현재 배터리: {soc_text}\n"
                     f"- 충전 속도: {kw_text}\n"
-                    f"- 완료 예상: {eta_text}"
+                    f"- 완료 예상: {duration_text}\n"
+                    f"- 예상 시각: {eta_clock_text}"
                 )
+
                 self.charging_notification_stage = "detailed_notified"
 
+    
     def update_daily_weekly_after_drive(self, session: Dict[str, Any]) -> None:
         self.reset_daily_weekly_if_needed()
 
