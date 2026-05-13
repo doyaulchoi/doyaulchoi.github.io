@@ -20,5 +20,12 @@
   "morning_alert": {
     "hour": 6,
     "minute": 30
+  },
+  "daily_report": {
+    "enabled": true,
+    "hour": 19,
+    "minute": 0,
+    "weekly_enabled": true,
+    "weekly_day": 4
   }
 }
