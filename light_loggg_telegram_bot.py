@@ -9,6 +9,8 @@ Operational policy:
 - Termux updates are performed by downloading raw files from GitHub.
 - Public config is stored in ~/light_loggg_tesla/light_loggg_public_config.json.
 - Sensitive values must stay in ~/.light_loggg.env or local token files.
+- /update downloads files, validates them, restarts polling, runs check_system.py,
+  and sends the diagnostic result back to Telegram.
 """
 
 from __future__ import annotations
@@ -51,6 +53,7 @@ UPDATE_LOG_FILE = LOG_DIR / "update.log"
 
 POLLING_SCRIPT_PATH = APP_DIR / "light_loggg_tesla_polling.py"
 BOT_SCRIPT_PATH = APP_DIR / "light_loggg_telegram_bot.py"
+CHECK_SCRIPT_PATH = APP_DIR / "check_system.py"
 
 BOOT_SOURCE_FILE = APP_DIR / "start-light-loggg.sh"
 BOOT_TARGET_DIR = Path.home() / ".termux" / "boot"
@@ -187,6 +190,27 @@ def tail_log(log_file: Path = DEFAULT_LOG_FILE, lines: int = 5) -> str:
         return "로그 확인 실패"
 
 
+def split_telegram_text(text: str, limit: int = 3500) -> list[str]:
+    if not text:
+        return [""]
+
+    chunks: list[str] = []
+    remaining = text
+
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n", 0, limit)
+        if cut < 500:
+            cut = limit
+
+        chunks.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+
+    return chunks
+
+
 def format_config_status(state: Dict[str, Any]) -> list[str]:
     last = state.get("last_poll") or {}
     config = last.get("config") or {}
@@ -198,7 +222,7 @@ def format_config_status(state: Dict[str, Any]) -> list[str]:
         if isinstance(polling, dict) and polling:
             return [
                 "설정:",
-                f"- source: public_config 추정",
+                "- source: public_config 추정",
                 f"- asleep: {polling.get('asleep_seconds', '-')}",
                 f"- online: {polling.get('online_seconds', '-')}",
                 f"- driving: {polling.get('driving_seconds', '-')}",
@@ -512,6 +536,49 @@ def start_polling_process() -> int:
     return process.pid
 
 
+def run_system_check() -> tuple[int, str]:
+    if not CHECK_SCRIPT_PATH.exists():
+        return 1, f"check_system.py 없음: {CHECK_SCRIPT_PATH}"
+
+    result = run_command(
+        [sys.executable, str(CHECK_SCRIPT_PATH)],
+        cwd=APP_DIR,
+        timeout=120,
+    )
+
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+
+    output = stdout.strip()
+
+    if stderr.strip():
+        output = output + "\n\n[stderr]\n" + stderr.strip()
+
+    if not output:
+        output = "(check_system 출력 없음)"
+
+    return result.returncode, output
+
+
+def summarize_check_result(exit_code: int, output: str) -> str:
+    fail_count = output.count("[FAIL]")
+    warn_count = output.count("[WARN]")
+    ok_count = output.count("[OK]")
+
+    if exit_code == 0 and fail_count == 0:
+        headline = "check_system 완료: 치명 오류 없음"
+    else:
+        headline = "check_system 완료: 확인 필요"
+
+    return (
+        f"{headline}\n"
+        f"- exit_code: {exit_code}\n"
+        f"- OK: {ok_count}\n"
+        f"- WARN: {warn_count}\n"
+        f"- FAIL: {fail_count}"
+    )
+
+
 def write_command(command: Dict[str, Any]) -> None:
     atomic_write_json(COMMAND_FILE, command)
 
@@ -551,6 +618,12 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
         stop_msg = stop_polling_process()
         new_pid = start_polling_process()
 
+        # Give polling a little time to write last_poll/logs after restart.
+        time.sleep(5)
+
+        check_exit_code, check_output = run_system_check()
+        check_summary = summarize_check_result(check_exit_code, check_output)
+
         elapsed = int((now_kst() - started_at).total_seconds())
 
         telegram_bot.send(
@@ -561,8 +634,15 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
             f"- {stop_msg}\n"
             f"- 새 polling PID: {new_pid}\n"
             f"- 소요 시간: {elapsed}초\n"
-            "참고: Telegram bot 자신은 현재 프로세스 그대로 유지됩니다. "
+            f"\n{check_summary}\n"
+            "\n참고: Telegram bot 자신은 현재 프로세스 그대로 유지됩니다. "
             "bot 코드 변경은 다음 부팅 또는 수동 재시작 후 완전히 반영됩니다.",
+        )
+
+        telegram_bot.send(
+            chat_id,
+            "check_system 상세 결과\n"
+            + check_output,
         )
 
         append_update_log("==== UPDATE END OK ====")
@@ -575,6 +655,21 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
             f"- 오류: {exc}\n"
             f"- 로그: {UPDATE_LOG_FILE}",
         )
+
+        try:
+            check_exit_code, check_output = run_system_check()
+            check_summary = summarize_check_result(check_exit_code, check_output)
+            telegram_bot.send(
+                chat_id,
+                "업데이트 실패 후 check_system 결과\n"
+                f"{check_summary}\n\n"
+                f"{check_output}",
+            )
+        except Exception as check_exc:
+            telegram_bot.send(
+                chat_id,
+                f"업데이트 실패 후 check_system 실행도 실패: {check_exc}",
+            )
 
 
 class TelegramBot:
@@ -590,23 +685,26 @@ class TelegramBot:
     def send(self, chat_id: str, text: str) -> None:
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
 
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-        }
+        for chunk in split_telegram_text(text, limit=3500):
+            payload = {
+                "chat_id": chat_id,
+                "text": chunk,
+            }
 
-        try:
-            response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+            try:
+                response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
 
-            if response.status_code >= 400:
-                print(
-                    f"Telegram sendMessage HTTP {response.status_code}: {response.text[:500]}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                if response.status_code >= 400:
+                    print(
+                        f"Telegram sendMessage HTTP {response.status_code}: {response.text[:500]}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
-        except requests.RequestException as exc:
-            print(f"Telegram sendMessage failed: {exc}", file=sys.stderr, flush=True)
+            except requests.RequestException as exc:
+                print(f"Telegram sendMessage failed: {exc}", file=sys.stderr, flush=True)
+
+            time.sleep(0.2)
 
     def allowed(self, chat_id: str) -> bool:
         if self.chat_id:
@@ -627,6 +725,7 @@ class TelegramBot:
                 "/daily\n"
                 "/weekly\n"
                 "/update\n"
+                "/check\n"
                 "/poll_now\n"
                 "/driving_start\n"
                 "/driving_stop",
@@ -643,6 +742,14 @@ class TelegramBot:
 
         elif command in {"/update", "update"}:
             update_and_restart_polling(self, chat_id)
+
+        elif command in {"/check", "check", "/check_system", "check_system"}:
+            exit_code, output = run_system_check()
+            summary = summarize_check_result(exit_code, output)
+            self.send(
+                chat_id,
+                summary + "\n\n" + output,
+            )
 
         elif command in {"/poll_now", "poll_now"}:
             write_command(
@@ -679,7 +786,7 @@ class TelegramBot:
             self.send(
                 chat_id,
                 "알 수 없는 명령어입니다.\n"
-                "사용 가능: /status, /daily, /weekly, /update, /poll_now, /driving_start, /driving_stop",
+                "사용 가능: /status, /daily, /weekly, /update, /check, /poll_now, /driving_start, /driving_stop",
             )
 
     def run_forever(self) -> None:
