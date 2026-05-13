@@ -844,6 +844,12 @@ class LightLogggPoller:
             "last_weekly_summary_iso": None,
             "last_morning_alert_date": None,
             "last_drive_end_soc": None,
+            "charge_session": {
+                "started_at": None,
+                "completed_at": None,
+                "start_soc": None,
+                "end_soc": None,
+            },
             "charging_stats": {
                 "total_added_soc": 0.0,
                 "powers": [],
@@ -1039,43 +1045,144 @@ class LightLogggPoller:
         now = now_kst()
         today_str = now.date().isoformat()
 
-        if now.hour != MORNING_ALERT_HOUR or now.minute < MORNING_ALERT_MINUTE:
+        target_time = now.replace(
+            hour=MORNING_ALERT_HOUR,
+            minute=MORNING_ALERT_MINUTE,
+            second=0,
+            microsecond=0,
+        )
+
+        # 06:30 이전에는 보내지 않음.
+        if now < target_time:
+            return
+
+        # 너무 늦게 켜진 경우 오후에 좋은아침 알림 날아가는 것 방지.
+        # 06:30 기준 2시간 안에만 발송.
+        if (now - target_time).total_seconds() > 2 * 3600:
             return
 
         if self.state.get("last_morning_alert_date") == today_str:
             return
 
-        if not vehicle:
-            self.telegram.send("굿모닝. 차량이 offline/asleep 상태라 현재 상세 상태를 확인하지 않았습니다.")
-            self.state["last_morning_alert_date"] = today_str
-            return
+        overnight_start = (target_time - timedelta(days=1)).replace(
+            hour=18,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
 
-        charge_state = vehicle.get("charge_state") or {}
-        current_soc = as_float(charge_state.get("battery_level"))
-        last_drive_soc = as_float(self.state.get("last_drive_end_soc"))
+        last_poll = self.state.get("last_poll") or {}
+        charge_session = self.state.get("charge_session") or {}
 
-        message = "굿모닝. 오늘의 차량 상태입니다.\n"
+        if vehicle:
+            charge_state = vehicle.get("charge_state") or {}
+        else:
+            charge_state = {}
 
-        if current_soc is not None:
-            message += f"- 배터리: {current_soc:.0f}%\n"
+        battery_level = as_float(charge_state.get("battery_level"))
+        if battery_level is None:
+            battery_level = as_float(last_poll.get("battery_level"))
 
-        if last_drive_soc is not None and current_soc is not None:
-            added_soc = current_soc - last_drive_soc
-            if added_soc > 0:
-                message += f"- 마지막 주행 종료 후 충전량: +{added_soc:.0f}%p\n"
+        charging_state = charge_state.get("charging_state") or last_poll.get("charging_state")
 
-                stats = self.state.get("charging_stats") or {}
-                powers = stats.get("powers") or []
-                if powers:
-                    avg_power = sum(powers) / len(powers)
-                    message += f"- 평균 충전 속도: {avg_power:.1f} kW\n"
+        charger_power = as_float(charge_state.get("charger_power"))
+        if charger_power is None:
+            charger_power = as_float(last_poll.get("charger_power_kw"))
 
-        self.telegram.send(message.rstrip())
+        time_to_full = as_float(charge_state.get("time_to_full_charge"))
+        if time_to_full is None:
+            time_to_full = as_float(last_poll.get("time_to_full_charge"))
+
+        est_range_km = miles_to_km(as_float(charge_state.get("est_battery_range")))
+        rated_range_km = miles_to_km(as_float(charge_state.get("battery_range")))
+        ideal_range_km = miles_to_km(as_float(charge_state.get("ideal_battery_range")))
+
+        if est_range_km is None:
+            est_range_km = as_float(last_poll.get("est_battery_range_km"))
+
+        if rated_range_km is None:
+            rated_range_km = as_float(last_poll.get("battery_range_km"))
+
+        if ideal_range_km is None:
+            ideal_range_km = as_float(last_poll.get("ideal_battery_range_km"))
+
+        if est_range_km is not None:
+            range_text = f"{est_range_km:.0f} km 예상"
+        elif rated_range_km is not None:
+            range_text = f"{rated_range_km:.0f} km rated"
+        elif ideal_range_km is not None:
+            range_text = f"{ideal_range_km:.0f} km ideal"
+        else:
+            range_text = "확인 불가"
+
+        battery_text = f"{battery_level:.0f}%" if battery_level is not None else "확인 불가"
+
+        lines = [
+            "좋은 아침 ☀️",
+            "두삼이 아침 현황입니다.",
+            f"- 현재 배터리: {battery_text}",
+            f"- 주행가능거리: {range_text}",
+        ]
+
+        session_started_at = parse_dt(charge_session.get("started_at"))
+        session_completed_at = parse_dt(charge_session.get("completed_at"))
+
+        include_charge_info = (
+            session_started_at is not None
+            and session_started_at.astimezone(KST) >= overnight_start
+        )
+
+        if include_charge_info:
+            started_text = session_started_at.astimezone(KST).strftime("%H:%M")
+
+            if charging_state == "Charging":
+                power_text = f"{charger_power:.1f} kW" if charger_power is not None else "확인 불가"
+                duration_text = format_duration_hours_minutes(time_to_full)
+                eta_text = format_eta_clock(time_to_full)
+
+                lines.extend(
+                    [
+                        "- 야간충전: 감지됨",
+                        f"- 충전 시작: {started_text}",
+                        "- 충전상태: 충전 중",
+                        f"- 충전속도: {power_text}",
+                        f"- 남은 시간: {duration_text}",
+                        f"- 완료 예상: {eta_text}",
+                    ]
+                )
+
+            elif session_completed_at:
+                completed_text = session_completed_at.astimezone(KST).strftime("%H:%M")
+
+                start_soc = as_float(charge_session.get("start_soc"))
+                end_soc = as_float(charge_session.get("end_soc"))
+
+                if start_soc is not None and end_soc is not None:
+                    soc_delta_text = f"{start_soc:.0f}% -> {end_soc:.0f}% (+{end_soc - start_soc:.0f}%p)"
+                else:
+                    soc_delta_text = "확인 불가"
+
+                lines.extend(
+                    [
+                        "- 야간충전: 감지됨",
+                        f"- 충전 시작: {started_text}",
+                        "- 충전상태: 충전 종료",
+                        f"- 종료 감지 시각: {completed_text}",
+                        f"- 충전량: {soc_delta_text}",
+                    ]
+                )
+
+            else:
+                lines.extend(
+                    [
+                        "- 야간충전: 감지됨",
+                        f"- 충전 시작: {started_text}",
+                        f"- 충전상태: {charging_state or '확인 불가'}",
+                    ]
+                )
+
+        self.telegram.send("\n".join(lines))
         self.state["last_morning_alert_date"] = today_str
-        self.state["charging_stats"] = {
-            "total_added_soc": 0.0,
-            "powers": [],
-        }
 
     def handle_charging_notifications(self, vehicle: Dict[str, Any]) -> None:
         charge_state = vehicle.get("charge_state") or {}
@@ -1093,6 +1200,14 @@ class LightLogggPoller:
 
         if self.charging_notification_stage == "idle":
             soc_text = f"{battery_level:.0f}%" if battery_level is not None else "확인 불가"
+            started_at = now_kst()
+
+            self.state["charge_session"] = {
+                "started_at": started_at.isoformat(),
+                "completed_at": None,
+                "start_soc": battery_level,
+                "end_soc": None,
+            }
 
             self.telegram.send(
                 "충전 시작\n"
@@ -1100,7 +1215,7 @@ class LightLogggPoller:
             )
 
             self.charging_notification_stage = "initial_notified"
-            self.charging_start_timestamp = now_kst()
+            self.charging_start_timestamp = started_at
             return
 
         if self.charging_notification_stage == "initial_notified":
@@ -1214,11 +1329,21 @@ class LightLogggPoller:
             vehicle_state = vehicle.get("vehicle_state") or {}
             drive_state = vehicle.get("drive_state") or {}
 
+            est_battery_range_km = miles_to_km(as_float(charge_state.get("est_battery_range")))
+            battery_range_km = miles_to_km(as_float(charge_state.get("battery_range")))
+            ideal_battery_range_km = miles_to_km(as_float(charge_state.get("ideal_battery_range")))
+
             payload.update(
                 {
                     "charging_state": charge_state.get("charging_state"),
                     "battery_level": charge_state.get("battery_level"),
                     "shift_state": drive_state.get("shift_state"),
+                    "charger_power_kw": charge_state.get("charger_power"),
+                    "time_to_full_charge": charge_state.get("time_to_full_charge"),
+                    "charge_limit_soc": charge_state.get("charge_limit_soc"),
+                    "est_battery_range_km": round(est_battery_range_km, 1) if est_battery_range_km is not None else None,
+                    "battery_range_km": round(battery_range_km, 1) if battery_range_km is not None else None,
+                    "ideal_battery_range_km": round(ideal_battery_range_km, 1) if ideal_battery_range_km is not None else None,
                 }
             )
 
@@ -1246,16 +1371,33 @@ class LightLogggPoller:
             self.state.get("external_drive_boost_until") or self.external_drive_boost_until
         )
 
-        self.handle_morning_alert(vehicle)
-
         charging = self.is_charging(vehicle)
 
         if charging and vehicle:
             self.handle_charging_notifications(vehicle)
-        else:
+        elif vehicle:
+            charge_state = vehicle.get("charge_state") or {}
+            current_charging_state = charge_state.get("charging_state")
+            battery_level = as_float(charge_state.get("battery_level"))
+
+            if self.charging_notification_stage != "idle":
+                charge_session = self.state.get("charge_session") or {}
+
+                if charge_session.get("started_at"):
+                    charge_session["completed_at"] = now_kst().isoformat()
+                    charge_session["end_soc"] = battery_level
+                    self.state["charge_session"] = charge_session
+
+                if current_charging_state == "Complete":
+                    self.telegram.send(
+                        "충전 완료\n"
+                        f"- 현재 배터리: {battery_level:.0f}%" if battery_level is not None else "- 현재 배터리: 확인 불가"
+                    )
+
             self.charging_notification_stage = "idle"
             self.charging_start_timestamp = None
 
+        self.handle_morning_alert(vehicle)
         if not vehicle or status in {"offline", "asleep"}:
             if self.should_boost_driving():
                 interval = POLL_DRIVING_SECONDS
