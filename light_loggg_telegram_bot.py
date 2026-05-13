@@ -793,15 +793,19 @@ class TelegramBot:
         if command in {"/start", "start"}:
             self.send(
                 chat_id,
-                "LIGHT LOGGG 명령\n"
-                "/status\n"
-                "/daily\n"
-                "/weekly\n"
-                "/update\n"
-                "/check\n"
-                "/poll_now\n"
-                "/driving_start\n"
-                "/driving_stop",
+                "🤖 LIGHT LOGGG 명령어\n\n"
+                "📊 상태 확인\n"
+                "  /status  - 현재 로거/차량 상태\n"
+                "  /check   - 시스템 진단\n\n"
+                "📈 주행 요약\n"
+                "  /daily   - 오늘 주행 요약\n"
+                "  /weekly  - 주간 주행 요약\n\n"
+                "🔄 업데이트\n"
+                "  /update  - GitHub 최신 코드 반영\n\n"
+                "⚡ 즉시 제어\n"
+                "  /poll_now       - 즉시 1회 polling 요청\n"
+                "  /driving_start  - 주행 시작 boost 요청\n"
+                "  /driving_stop   - 주행 boost 해제\n"
             )
 
         elif command in {"/status", "status"}:
@@ -859,8 +863,19 @@ class TelegramBot:
         else:
             self.send(
                 chat_id,
-                "알 수 없는 명령어입니다.\n"
-                "사용 가능: /status, /daily, /weekly, /update, /check, /poll_now, /driving_start, /driving_stop",
+                "🤖 LIGHT LOGGG 명령어\n\n"
+                "📊 상태 확인\n"
+                "  /status  - 현재 로거/차량 상태\n"
+                "  /check   - 시스템 진단\n\n"
+                "📈 주행 요약\n"
+                "  /daily   - 오늘 주행 요약\n"
+                "  /weekly  - 주간 주행 요약\n\n"
+                "🔄 업데이트\n"
+                "  /update  - GitHub 최신 코드 반영\n\n"
+                "⚡ 즉시 제어\n"
+                "  /poll_now       - 즉시 1회 polling 요청\n"
+                "  /driving_start  - 주행 시작 boost 요청\n"
+                "  /driving_stop   - 주행 boost 해제\n"
             )
 
     def run_forever(self) -> None:
