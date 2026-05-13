@@ -49,6 +49,12 @@ UPDATE_LOG_FILE = LOG_DIR / "update.log"
 POLLING_SCRIPT_PATH = APP_DIR / "light_loggg_tesla_polling.py"
 BOT_SCRIPT_PATH = APP_DIR / "light_loggg_telegram_bot.py"
 
+BOOT_SOURCE_FILE = APP_DIR / "start-light-loggg.sh"
+BOOT_TARGET_DIR = Path.home() / ".termux" / "boot"
+BOOT_TARGET_FILE = BOOT_TARGET_DIR / "start-light-loggg.sh"
+
+COMMAND_FILE = APP_DIR / "command.json"
+
 UPDATE_FILES = [
     "light_loggg_tesla_polling.py",
     "light_loggg_telegram_bot.py",
@@ -61,7 +67,6 @@ UPDATE_FILES = [
     "telemetry_server.py",
     "tesla_telemetry_handler.py",
 ]
-
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -91,9 +96,23 @@ def load_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
         return dict(default)
 
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+        return dict(default)
     except Exception:
         return dict(default)
+
+
+def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(path)
 
 
 def as_float(value: Any) -> Optional[float]:
@@ -117,18 +136,22 @@ def parse_dt(value: Any) -> Optional[datetime]:
 
 def append_update_log(text: str) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+
     with UPDATE_LOG_FILE.open("a", encoding="utf-8") as file:
         file.write(f"[{now_kst().isoformat()}] {text}\n")
 
 
-def process_alive(pid_file: Path = DEFAULT_PID_FILE) -> Optional[bool]:
-    if not pid_file.exists():
+def read_pid(pid_file: Path) -> Optional[int]:
+    try:
+        return int(pid_file.read_text(encoding="utf-8").strip())
+    except Exception:
         return None
 
-    try:
-        pid_text = pid_file.read_text(encoding="utf-8").strip()
-        pid = int(pid_text)
-    except Exception:
+
+def process_alive(pid_file: Path = DEFAULT_PID_FILE) -> Optional[bool]:
+    pid = read_pid(pid_file)
+
+    if pid is None:
         return None
 
     try:
@@ -138,13 +161,6 @@ def process_alive(pid_file: Path = DEFAULT_PID_FILE) -> Optional[bool]:
         return False
     except PermissionError:
         return True
-    except Exception:
-        return None
-
-
-def read_pid(pid_file: Path) -> Optional[int]:
-    try:
-        return int(pid_file.read_text(encoding="utf-8").strip())
     except Exception:
         return None
 
@@ -172,11 +188,14 @@ def format_daily_summary(state: Dict[str, Any]) -> str:
 
     distance = float(daily.get("total_distance_km") or 0)
     seconds = float(daily.get("total_time_seconds") or 0)
+    energy = float(daily.get("total_energy_kwh") or 0)
 
     avg_speed = distance / (seconds / 3600) if seconds > 0 else 0
 
     effs = daily.get("efficiencies") or []
-    avg_eff = sum(effs) / len(effs) if effs else 0
+    avg_eff_from_list = sum(effs) / len(effs) if effs else 0
+    avg_eff_from_energy = distance / energy if energy > 0 else 0
+    avg_eff = avg_eff_from_energy or avg_eff_from_list
 
     start_soc = daily.get("start_soc")
     end_soc = daily.get("end_soc")
@@ -206,12 +225,14 @@ def format_weekly_summary(state: Dict[str, Any]) -> str:
     seconds = float(weekly.get("total_time_seconds") or 0)
     energy = float(weekly.get("total_energy_kwh") or 0)
 
+    avg_speed = distance / (seconds / 3600) if seconds > 0 else 0
     avg_eff = distance / energy if energy > 0 else 0
 
     return (
         f"주간 주행 요약 {weekly.get('week') or '-'}\n"
         f"누적거리 {distance:.2f} km\n"
         f"누적시간 {seconds / 60:.0f}분\n"
+        f"평균속도 {avg_speed:.1f} km/h\n"
         f"평균전비 {avg_eff:.2f} km/kWh\n"
         f"주행횟수 {int(weekly.get('drive_count') or 0)}회"
     )
@@ -221,7 +242,7 @@ def format_status(state_file: Path) -> str:
     state = load_json(state_file, {})
     last = state.get("last_poll") or {}
 
-    running = process_alive()
+    running = process_alive(DEFAULT_PID_FILE)
     if running is True:
         running_text = "확인됨"
     elif running is False:
@@ -240,6 +261,10 @@ def format_status(state_file: Path) -> str:
     speed = as_float(last.get("speed_kmh"))
     odometer = as_float(last.get("odometer_km"))
     next_seconds = last.get("next_seconds")
+    external_drive_boost = last.get("external_drive_boost")
+
+    polling_pid = read_pid(DEFAULT_PID_FILE)
+    bot_pid = read_pid(BOT_PID_FILE)
 
     lines = [
         "LIGHT LOGGG 상태",
@@ -261,8 +286,8 @@ def format_status(state_file: Path) -> str:
     if odometer is not None:
         lines.append(f"누적 주행거리: {odometer:.1f} km")
 
-    polling_pid = read_pid(DEFAULT_PID_FILE)
-    bot_pid = read_pid(BOT_PID_FILE)
+    if external_drive_boost is not None:
+        lines.append(f"외부 주행 boost: {'ON' if external_drive_boost else 'OFF'}")
 
     if polling_pid is not None:
         lines.append(f"polling PID: {polling_pid}")
@@ -314,7 +339,17 @@ def download_file(filename: str) -> None:
     temp = APP_DIR / f".{filename}.tmp"
 
     result = run_command(
-        ["curl", "-fL", "--connect-timeout", "15", "--max-time", "60", "-o", str(temp), url],
+        [
+            "curl",
+            "-fL",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "60",
+            "-o",
+            str(temp),
+            url,
+        ],
         timeout=90,
     )
 
@@ -346,6 +381,20 @@ def py_compile_file(path: Path) -> None:
         raise RuntimeError(f"{path.name} 문법 검사 실패: {result.stderr or result.stdout}")
 
 
+def install_boot_script() -> str:
+    if not BOOT_SOURCE_FILE.exists():
+        return "boot script 원본 없음. 설치 생략."
+
+    BOOT_TARGET_DIR.mkdir(parents=True, exist_ok=True)
+
+    temp = BOOT_TARGET_FILE.with_suffix(".tmp")
+    temp.write_text(BOOT_SOURCE_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+    temp.chmod(0o755)
+    temp.replace(BOOT_TARGET_FILE)
+
+    return f"boot script 설치 완료: {BOOT_TARGET_FILE}"
+
+
 def stop_polling_process() -> str:
     pid = read_pid(DEFAULT_PID_FILE)
 
@@ -368,6 +417,7 @@ def stop_polling_process() -> str:
     except ProcessLookupError:
         DEFAULT_PID_FILE.unlink(missing_ok=True)
         return f"polling PID {pid}는 이미 종료됨"
+
     except Exception as exc:
         run_command(["pkill", "-f", "light_loggg_tesla_polling.py"], timeout=10)
         DEFAULT_PID_FILE.unlink(missing_ok=True)
@@ -378,6 +428,7 @@ def start_polling_process() -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     python_executable = shutil.which("python3") or shutil.which("python") or sys.executable
+
     if not python_executable:
         raise RuntimeError("python 실행 파일을 찾지 못함")
 
@@ -394,6 +445,10 @@ def start_polling_process() -> int:
     DEFAULT_PID_FILE.write_text(str(process.pid) + "\n", encoding="utf-8")
 
     return process.pid
+
+
+def write_command(command: Dict[str, Any]) -> None:
+    atomic_write_json(COMMAND_FILE, command)
 
 
 def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
@@ -424,6 +479,8 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
             if path.exists():
                 py_compile_file(path)
 
+        boot_msg = install_boot_script()
+
         stop_msg = stop_polling_process()
         new_pid = start_polling_process()
 
@@ -432,6 +489,7 @@ def update_and_restart_polling(telegram_bot: Any, chat_id: str) -> None:
         telegram_bot.send(
             chat_id,
             "업데이트 완료\n"
+            f"- {boot_msg}\n"
             f"- {stop_msg}\n"
             f"- 새 polling PID: {new_pid}\n"
             f"- 소요 시간: {elapsed}초\n"
@@ -471,12 +529,14 @@ class TelegramBot:
 
         try:
             response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+
             if response.status_code >= 400:
                 print(
                     f"Telegram sendMessage HTTP {response.status_code}: {response.text[:500]}",
                     file=sys.stderr,
                     flush=True,
                 )
+
         except requests.RequestException as exc:
             print(f"Telegram sendMessage failed: {exc}", file=sys.stderr, flush=True)
 
@@ -492,7 +552,17 @@ class TelegramBot:
         state = load_json(self.state_file, {})
 
         if command in {"/start", "start"}:
-            self.send(chat_id, "LIGHT LOGGG 명령: /status, /daily, /weekly, /update")
+            self.send(
+                chat_id,
+                "LIGHT LOGGG 명령\n"
+                "/status\n"
+                "/daily\n"
+                "/weekly\n"
+                "/update\n"
+                "/poll_now\n"
+                "/driving_start\n"
+                "/driving_stop",
+            )
 
         elif command in {"/status", "status"}:
             self.send(chat_id, format_status(self.state_file))
@@ -506,8 +576,43 @@ class TelegramBot:
         elif command in {"/update", "update"}:
             update_and_restart_polling(self, chat_id)
 
+        elif command in {"/poll_now", "poll_now"}:
+            write_command(
+                {
+                    "command": "poll_now",
+                    "source": "telegram",
+                    "time": now_kst().isoformat(),
+                }
+            )
+            self.send(chat_id, "poll_now 명령 파일 생성 완료")
+
+        elif command in {"/driving_start", "driving_start"}:
+            write_command(
+                {
+                    "command": "driving_start",
+                    "source": "telegram",
+                    "seconds": 180,
+                    "time": now_kst().isoformat(),
+                }
+            )
+            self.send(chat_id, "driving_start 명령 파일 생성 완료. polling boost 요청됨.")
+
+        elif command in {"/driving_stop", "driving_stop"}:
+            write_command(
+                {
+                    "command": "driving_stop",
+                    "source": "telegram",
+                    "time": now_kst().isoformat(),
+                }
+            )
+            self.send(chat_id, "driving_stop 명령 파일 생성 완료. polling boost 해제 요청됨.")
+
         else:
-            self.send(chat_id, "알 수 없는 명령어입니다. 사용 가능: /status, /daily, /weekly, /update")
+            self.send(
+                chat_id,
+                "알 수 없는 명령어입니다.\n"
+                "사용 가능: /status, /daily, /weekly, /update, /poll_now, /driving_start, /driving_stop",
+            )
 
     def run_forever(self) -> None:
         print("LIGHT LOGGG Telegram command bot started", flush=True)
@@ -549,6 +654,7 @@ class TelegramBot:
 
             except KeyboardInterrupt:
                 raise
+
             except Exception as exc:
                 print(f"Telegram bot error: {exc}", file=sys.stderr, flush=True)
                 time.sleep(5)
