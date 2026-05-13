@@ -367,6 +367,7 @@ def safe_int(value: Any, default: int = 0) -> int:
     except Exception:
         return default
 
+
 def format_duration_hours_minutes(hours_value: Optional[float]) -> str:
     if hours_value is None or hours_value <= 0:
         return "확인 불가"
@@ -1076,7 +1077,7 @@ class LightLogggPoller:
             "powers": [],
         }
 
-        def handle_charging_notifications(self, vehicle: Dict[str, Any]) -> None:
+    def handle_charging_notifications(self, vehicle: Dict[str, Any]) -> None:
         charge_state = vehicle.get("charge_state") or {}
 
         battery_level = as_float(charge_state.get("battery_level"))
