@@ -843,6 +843,14 @@ class LightLogggPoller:
             "last_weekly_summary_iso": None,
             "last_morning_alert_date": None,
             "last_drive_end_soc": None,
+            "external_drive_session": {
+                "active": False,
+                "start_time": None,
+                "start_odometer_km": None,
+                "start_soc": None,
+            },
+            "external_drive_pending_start": False,
+            "external_drive_pending_stop": False,
             "charge_session": {
                 "started_at": None,
                 "completed_at": None,
@@ -977,20 +985,16 @@ class LightLogggPoller:
                 seconds = EXTERNAL_DRIVE_BOOST_SECONDS
 
             self.external_drive_boost_until = time.time() + seconds
-            self.telegram.send(
-                "외부 주행 시작 신호 수신\n"
-                f"- source: {command.get('source') or '-'}\n"
-                f"- boost: {seconds}초"
-            )
+            self.state["external_drive_pending_start"] = True
+            self.state["external_drive_pending_stop"] = False
+
             self.save_state()
             return "poll_now"
 
         if name in {"driving_stop", "drive_stop", "stop_driving", "clear_boost"}:
             self.external_drive_boost_until = 0.0
-            self.telegram.send(
-                "외부 주행 종료 신호 수신\n"
-                f"- source: {command.get('source') or '-'}"
-            )
+            self.state["external_drive_pending_stop"] = True
+
             self.save_state()
             return "poll_now"
 
@@ -1001,6 +1005,105 @@ class LightLogggPoller:
     def should_boost_driving(self) -> bool:
         return self.external_drive_boost_until > time.time()
 
+
+    def handle_external_drive_start(self, sample: Sample) -> None:
+        self.state["external_drive_session"] = {
+            "active": True,
+            "start_time": sample.time.isoformat(),
+            "start_odometer_km": sample.odometer_km,
+            "start_soc": sample.battery_level,
+        }
+        self.state["external_drive_pending_start"] = False
+
+    def handle_external_drive_stop(self, sample: Sample) -> Optional[Dict[str, Any]]:
+        session = self.state.get("external_drive_session") or {}
+
+        self.state["external_drive_pending_stop"] = False
+
+        if not session.get("active"):
+            return None
+
+        start_time = parse_dt(session.get("start_time"))
+        start_odometer_km = as_float(session.get("start_odometer_km"))
+        start_soc = as_float(session.get("start_soc"))
+
+        end_time = sample.time
+        end_odometer_km = sample.odometer_km
+        end_soc = sample.battery_level
+
+        if start_time is not None:
+            time_seconds = max(0.0, (end_time - start_time).total_seconds())
+        else:
+            time_seconds = 0.0
+
+        if start_odometer_km is not None and end_odometer_km is not None:
+            distance_km = max(0.0, end_odometer_km - start_odometer_km)
+        else:
+            distance_km = 0.0
+
+        avg_speed = distance_km / (time_seconds / 3600.0) if time_seconds > 0 else 0.0
+
+        result = {
+            "start_time": start_time.isoformat() if start_time else None,
+            "end_time": end_time.isoformat(),
+            "start_odometer_km": start_odometer_km,
+            "end_odometer_km": end_odometer_km,
+            "distance_km": round(distance_km, 3),
+            "time_seconds": round(time_seconds, 1),
+            "avg_speed_kmh": round(avg_speed, 1),
+            "energy_kwh": 0.0,
+            "avg_efficiency_km_per_kwh": 0.0,
+            "start_soc": start_soc,
+            "end_soc": end_soc,
+            "accel_count": 0,
+            "decel_count": 0,
+        }
+
+        self.state["external_drive_session"] = {
+            "active": False,
+            "start_time": None,
+            "start_odometer_km": None,
+            "start_soc": None,
+        }
+
+        self.state["last_drive_end_soc"] = end_soc
+
+        return result
+
+    def send_drive_end_summary(self, session: Dict[str, Any]) -> None:
+        distance_km = float(session.get("distance_km") or 0.0)
+
+        if distance_km < 1.0:
+            return
+
+        time_seconds = float(session.get("time_seconds") or 0.0)
+        avg_speed = float(session.get("avg_speed_kmh") or 0.0)
+
+        start_soc = as_float(session.get("start_soc"))
+        end_soc = as_float(session.get("end_soc"))
+
+        if start_soc is not None and end_soc is not None:
+            battery_text = f"{start_soc:.0f}% → {end_soc:.0f}% ({start_soc - end_soc:.0f}%p 사용)"
+        else:
+            battery_text = "확인 불가"
+
+        if time_seconds >= 3600:
+            hours = int(time_seconds // 3600)
+            minutes = int((time_seconds % 3600) // 60)
+            duration_text = f"{hours}시간 {minutes}분"
+        else:
+            minutes = int(round(time_seconds / 60))
+            duration_text = f"{minutes}분"
+
+        self.telegram.send(
+            "두삼이 주행 종료\n"
+            f"- 주행거리: {distance_km:.2f} km\n"
+            f"- 주행시간: {duration_text}\n"
+            f"- 배터리: {battery_text}\n"
+            f"- 평균속도: {avg_speed:.1f} km/h"
+        )
+
+    
     # -------------------------
     # Vehicle parsing
     # -------------------------
@@ -1409,6 +1512,28 @@ class LightLogggPoller:
 
         sample = self.sample_from_vehicle(vehicle)
 
+        if self.state.get("external_drive_pending_start"):
+            self.handle_external_drive_start(sample)
+
+        if self.state.get("external_drive_pending_stop"):
+            external_session = self.handle_external_drive_stop(sample)
+
+            if external_session:
+                self.update_daily_weekly_after_drive(external_session)
+                self.send_drive_end_summary(external_session)
+
+            # 내부 주행 세션은 외부 BT 기준 종료가 들어왔으므로 정리한다.
+            self.drive = DriveSession()
+
+            if charging:
+                interval = POLL_CHARGING_SECONDS
+            else:
+                interval = POLL_ONLINE_SECONDS
+
+            self.update_last_poll(status, vehicle, interval, sample)
+            self.save_state()
+            return interval
+
         was_driving = self.drive.active
         is_driving = self.is_driving(sample)
 
@@ -1425,32 +1550,10 @@ class LightLogggPoller:
                 self.state["last_drive_end_soc"] = sample.battery_level
                 self.update_daily_weekly_after_drive(session)
 
-                distance_km = float(session.get("distance_km") or 0.0)
-
-                if distance_km >= 1.0:
-                    energy_kwh = float(session.get("energy_kwh") or 0.0)
-                    avg_eff = float(session.get("avg_efficiency_km_per_kwh") or 0.0)
-                    avg_speed = float(session.get("avg_speed_kmh") or 0.0)
-
-                    start_soc = session.get("start_soc")
-                    end_soc = session.get("end_soc")
-
-                    if isinstance(start_soc, (int, float)) and isinstance(end_soc, (int, float)):
-                        battery_text = f"{start_soc:.0f}% → {end_soc:.0f}% ({start_soc - end_soc:.0f}%p 사용)"
-                    else:
-                        battery_text = f"{start_soc or '-'}% → {end_soc or '-'}%"
-
-                    energy_text = f"{energy_kwh:.2f} kWh" if energy_kwh > 0 else "확인 불가"
-                    eff_text = f"{avg_eff:.2f} km/kWh" if avg_eff > 0 else "확인 불가"
-
-                    self.telegram.send(
-                        "두삼이 주행 종료\n"
-                        f"- 주행거리: {distance_km:.2f} km\n"
-                        f"- 배터리: {battery_text}\n"
-                        f"- 소모량: {energy_text}\n"
-                        f"- 평균속도: {avg_speed:.1f} km/h\n"
-                        f"- 주행 전비: {eff_text}"
-                    )
+            if was_driving:
+                session = self.drive.end(sample)
+                self.state["last_drive_end_soc"] = sample.battery_level
+                self.update_daily_weekly_after_drive(session)
 
             if charging:
                 interval = POLL_CHARGING_SECONDS
