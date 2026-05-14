@@ -85,10 +85,10 @@ DEFAULT_TESLA_SCOPE = "openid offline_access user_data vehicle_device_data"
 DEFAULT_PUBLIC_CONFIG: Dict[str, Any] = {
     "polling": {
         "asleep_seconds": 1800,
-        "online_seconds": 300,
+        "online_seconds": 900,
         "driving_seconds": 300,
         "charging_seconds": 300,
-        "error_seconds": 300,
+        "error_seconds": 900,
     },
     "alerts": {
         "threshold_km_per_kwh": 4.5,
@@ -221,7 +221,7 @@ PUBLIC_CONFIG: Dict[str, Any] = dict(DEFAULT_PUBLIC_CONFIG)
 
 POLL_ASLEEP_SECONDS = 1800
 POLL_ONLINE_SECONDS = 900
-POLL_DRIVING_SECONDS = 900
+POLL_DRIVING_SECONDS = 300
 POLL_CHARGING_SECONDS = 300
 POLL_ERROR_SECONDS = 900
 
@@ -263,7 +263,7 @@ def init_runtime_config(config_file: Path) -> None:
         PUBLIC_CONFIG, "polling", "driving_seconds", "LIGHT_LOGGG_POLL_DRIVING_SECONDS", 300
     )
     POLL_CHARGING_SECONDS = cfg_int(
-        PUBLIC_CONFIG, "polling", "charging_seconds", "LIGHT_LOGGG_POLL_CHARGING_SECONDS", 900
+        PUBLIC_CONFIG, "polling", "charging_seconds", "LIGHT_LOGGG_POLL_CHARGING_SECONDS", 300
     )
     POLL_ERROR_SECONDS = cfg_int(
         PUBLIC_CONFIG, "polling", "error_seconds", "LIGHT_LOGGG_POLL_ERROR_SECONDS", 900
@@ -284,7 +284,7 @@ def init_runtime_config(config_file: Path) -> None:
     )
 
     EXTERNAL_DRIVE_BOOST_SECONDS = cfg_int(
-        PUBLIC_CONFIG, "external_commands", "drive_boost_seconds", "LIGHT_LOGGG_EXTERNAL_DRIVE_BOOST_SECONDS", 180
+        PUBLIC_CONFIG, "external_commands", "drive_boost_seconds", "LIGHT_LOGGG_EXTERNAL_DRIVE_BOOST_SECONDS", 600
     )
 
     MORNING_ALERT_HOUR = cfg_int(
@@ -377,6 +377,46 @@ def as_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def find_first_numeric_value(data: Any, target_keys: set[str]) -> Optional[float]:
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if str(key) in target_keys:
+                number = as_float(value)
+                if number is not None:
+                    return number
+
+        for value in data.values():
+            found = find_first_numeric_value(value, target_keys)
+            if found is not None:
+                return found
+
+    elif isinstance(data, list):
+        for item in data:
+            found = find_first_numeric_value(item, target_keys)
+            if found is not None:
+                return found
+
+    return None
+
+
+def find_odometer_miles(vehicle_data: Dict[str, Any]) -> Optional[float]:
+    vehicle_state = vehicle_data.get("vehicle_state") or {}
+    drive_state = vehicle_data.get("drive_state") or {}
+
+    candidates = [
+        vehicle_state.get("odometer"),
+        drive_state.get("odometer"),
+        vehicle_data.get("odometer"),
+    ]
+
+    for candidate in candidates:
+        odometer = as_float(candidate)
+        if odometer is not None:
+            return odometer
+
+    return find_first_numeric_value(vehicle_data, {"odometer"})
 
 
 def speed_mph_to_kmh(speed_mph: Optional[float]) -> Optional[float]:
@@ -601,6 +641,7 @@ TRIP_CSV_FIELDS = [
     "start_time",
     "end_time",
     "distance_km",
+    "distance_source",
     "duration_min",
     "avg_speed_kmh",
     "start_soc",
@@ -660,6 +701,7 @@ def append_trip_csv(csv_file: Path, session: Dict[str, Any], source: str) -> Non
         "start_time": start_time_text,
         "end_time": end_time_text,
         "distance_km": round(distance_km, 3) if distance_km is not None else "",
+        "distance_source": session.get("distance_source") or "",
         "duration_min": round(time_seconds / 60, 1) if time_seconds is not None else "",
         "avg_speed_kmh": round(avg_speed_kmh, 1) if avg_speed_kmh is not None else "",
         "start_soc": round(start_soc, 1) if start_soc is not None else "",
@@ -788,6 +830,7 @@ class DriveSession:
             "start_odometer_km": self.start_odometer_km,
             "end_odometer_km": sample.odometer_km,
             "distance_km": round(self.distance_km, 3),
+            "distance_source": "odometer_or_speed_polling",
             "time_seconds": round(self.time_seconds, 1),
             "avg_speed_kmh": round(avg_speed, 1),
             "energy_kwh": round(self.energy_kwh, 3),
@@ -860,6 +903,7 @@ class TelegramClient:
 
         try:
             response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+
             if response.status_code >= 400:
                 print(
                     f"Telegram error {response.status_code}: {response.text[:300]}",
@@ -867,15 +911,16 @@ class TelegramClient:
                     flush=True,
                 )
                 return False
+
             return True
+
         except requests.RequestException as exc:
-            print(f"Telegram document request failed: {exc}", file=sys.stderr, flush=True)
+            print(f"Telegram request failed: {exc}", file=sys.stderr, flush=True)
             return False
 
         except Exception as exc:
-            print(f"Telegram document send failed: {exc}", file=sys.stderr, flush=True)
+            print(f"Telegram send failed: {exc}", file=sys.stderr, flush=True)
             return False
-
 
     def send_document(self, file_path: Path, caption: str = "") -> bool:
         if not self.enabled:
@@ -930,6 +975,10 @@ class TelegramClient:
 
         except requests.RequestException as exc:
             print(f"Telegram document request failed: {exc}", file=sys.stderr, flush=True)
+            return False
+
+        except Exception as exc:
+            print(f"Telegram document send failed: {exc}", file=sys.stderr, flush=True)
             return False
 
 
@@ -1460,8 +1509,11 @@ class LightLogggPoller:
         else:
             time_seconds = 0.0
 
+        distance_source = "unknown"
+
         if start_odometer_km is not None and end_odometer_km is not None:
             distance_km = max(0.0, end_odometer_km - start_odometer_km)
+            distance_source = "odometer"
         else:
             distance_km = 0.0
 
@@ -1475,6 +1527,7 @@ class LightLogggPoller:
 
             if gps_distance_km is not None:
                 distance_km = gps_distance_km
+                distance_source = "gps_straight_line"
 
         avg_speed = distance_km / (time_seconds / 3600.0) if time_seconds > 0 else 0.0
 
@@ -1484,6 +1537,7 @@ class LightLogggPoller:
             "start_odometer_km": start_odometer_km,
             "end_odometer_km": end_odometer_km,
             "distance_km": round(distance_km, 3),
+            "distance_source": distance_source,
             "time_seconds": round(time_seconds, 1),
             "avg_speed_kmh": round(avg_speed, 1),
             "energy_kwh": 0.0,
@@ -1534,8 +1588,18 @@ class LightLogggPoller:
 
     def send_drive_end_summary(self, session: Dict[str, Any]) -> None:
         distance_km = float(session.get("distance_km") or 0.0)
+        distance_source = str(session.get("distance_source") or "")
         time_seconds = float(session.get("time_seconds") or 0.0)
         avg_speed = float(session.get("avg_speed_kmh") or 0.0)
+
+        if distance_source == "odometer":
+            distance_text = f"{distance_km:.2f} km"
+        elif distance_source == "gps_straight_line":
+            distance_text = f"{distance_km:.2f} km (직선거리 추정)"
+        elif distance_source:
+            distance_text = f"{distance_km:.2f} km ({distance_source})"
+        else:
+            distance_text = f"{distance_km:.2f} km"
 
         start_soc = as_float(session.get("start_soc"))
         end_soc = as_float(session.get("end_soc"))
@@ -1567,7 +1631,7 @@ class LightLogggPoller:
 
         self.telegram.send(
             "두삼이 주행 종료\n"
-            f"- 주행거리: {distance_km:.2f} km\n"
+            f"- 주행거리: {distance_text}\n"
             f"- 주행시간: {duration_text}\n"
             f"- 배터리: {battery_text}\n"
             f"- 평균속도: {avg_speed:.1f} km/h\n"
@@ -1756,7 +1820,7 @@ class LightLogggPoller:
         vehicle_state = vehicle.get("vehicle_state") or {}
 
         speed_mph = as_float(drive_state.get("speed"))
-        odometer_miles = as_float(vehicle_state.get("odometer"))
+        odometer_miles = find_odometer_miles(vehicle)
         drive_power = as_float(drive_state.get("power"))
         charger_power = as_float(charge_state.get("charger_power"))
         power_kw = drive_power if drive_power is not None else charger_power
@@ -2089,7 +2153,7 @@ class LightLogggPoller:
                 }
             )
 
-            odometer_miles = as_float(vehicle_state.get("odometer"))
+            odometer_miles = find_odometer_miles(vehicle)
             odometer_km = miles_to_km(odometer_miles)
             if odometer_km is not None:
                 payload["odometer_km"] = round(odometer_km, 1)
