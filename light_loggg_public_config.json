@@ -1,10 +1,10 @@
 {
   "polling": {
     "asleep_seconds": 1800,
-    "online_seconds": 300,
+    "online_seconds": 900,
     "driving_seconds": 300,
-    "charging_seconds": 300,
-    "error_seconds": 300
+    "charging_seconds": 900,
+    "error_seconds": 900
   },
   "alerts": {
     "threshold_km_per_kwh": 4.5,
