@@ -96,7 +96,7 @@ DEFAULT_PUBLIC_CONFIG: Dict[str, Any] = {
         "alert_cooldown_seconds": 60,
     },
     "external_commands": {
-        "drive_boost_seconds": 180,
+        "drive_boost_seconds": 600,
     },
     "request": {
         "timeout_seconds": 25,
@@ -230,7 +230,7 @@ THRESHOLD_EFFICIENCY = 4.5
 LOW_EFFICIENCY_ALERT_COOLDOWN = 60
 
 REQUEST_TIMEOUT = 25
-EXTERNAL_DRIVE_BOOST_SECONDS = 180
+EXTERNAL_DRIVE_BOOST_SECONDS = 600
 
 MORNING_ALERT_HOUR = 6
 MORNING_ALERT_MINUTE = 30
@@ -869,7 +869,11 @@ class TelegramClient:
                 return False
             return True
         except requests.RequestException as exc:
-            print(f"Telegram request failed: {exc}", file=sys.stderr, flush=True)
+            print(f"Telegram document request failed: {exc}", file=sys.stderr, flush=True)
+            return False
+
+        except Exception as exc:
+            print(f"Telegram document send failed: {exc}", file=sys.stderr, flush=True)
             return False
 
 
@@ -1127,6 +1131,10 @@ class TeslaFleetClient:
         if not isinstance(vehicle_data, dict):
             return status, None
 
+        for key in ("id", "id_s", "vin", "display_name"):
+            if key not in vehicle_data and target.get(key) is not None:
+                vehicle_data[key] = target.get(key)
+
         return status, vehicle_data
 
 
@@ -1229,6 +1237,9 @@ class LightLogggPoller:
                 "start_time": None,
                 "start_odometer_km": None,
                 "start_soc": None,
+                "start_latitude": None,
+                "start_longitude": None,
+                "start_address": None,
             },
             "external_drive_pending_start": False,
             "external_drive_pending_stop": False,
@@ -1363,6 +1374,8 @@ class LightLogggPoller:
             if seconds <= 0:
                 seconds = EXTERNAL_DRIVE_BOOST_SECONDS
 
+            seconds = max(seconds, EXTERNAL_DRIVE_BOOST_SECONDS, POLL_DRIVING_SECONDS * 2)
+
             self.external_drive_boost_until = time.time() + seconds
             self.state["external_drive_pending_start"] = True
             self.state["external_drive_pending_stop"] = False
@@ -1398,6 +1411,12 @@ class LightLogggPoller:
 
 
     def handle_external_drive_start(self, sample: Sample) -> None:
+        existing_session = self.state.get("external_drive_session") or {}
+
+        if existing_session.get("active"):
+            self.state["external_drive_pending_start"] = False
+            return
+
         self.state["external_drive_session"] = {
             "active": True,
             "start_time": sample.time.isoformat(),
