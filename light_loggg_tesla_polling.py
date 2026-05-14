@@ -1138,13 +1138,74 @@ class LightLogggPoller:
         }
         self.state["external_drive_pending_start"] = False
 
+        soc_text = f"{sample.battery_level:.0f}%" if sample.battery_level is not None else "확인 불가"
+        odo_text = f"{sample.odometer_km:.1f} km" if sample.odometer_km is not None else "확인 불가"
+
+        self.telegram.send(
+            "두삼이 주행 시작\n"
+            f"- 시작 배터리: {soc_text}\n"
+            f"- 시작 누적거리: {odo_text}\n"
+            "- source: external_http"
+        )
+        self.state["external_drive_pending_start"] = False
+
     def handle_external_drive_stop(self, sample: Sample) -> Optional[Dict[str, Any]]:
         session = self.state.get("external_drive_session") or {}
 
         self.state["external_drive_pending_stop"] = False
 
         if not session.get("active"):
+            self.telegram.send(
+                "두삼이 주행 종료 요청 수신\n"
+                "- 결과: 종료할 외부 주행 세션 없음\n"
+                "- 원인 후보: driving_start HTTP 실패, poller가 시작 명령을 처리하기 전 stop 수신, 또는 state 초기화"
+            )
             return None
+
+        start_time = parse_dt(session.get("start_time"))
+        start_odometer_km = as_float(session.get("start_odometer_km"))
+        start_soc = as_float(session.get("start_soc"))
+
+        end_time = sample.time
+        end_odometer_km = sample.odometer_km
+        end_soc = sample.battery_level
+
+        if start_time is not None:
+            time_seconds = max(0.0, (end_time - start_time).total_seconds())
+        else:
+            time_seconds = 0.0
+
+        if start_odometer_km is not None and end_odometer_km is not None:
+            distance_km = max(0.0, end_odometer_km - start_odometer_km)
+        else:
+            distance_km = 0.0
+
+        avg_speed = distance_km / (time_seconds / 3600.0) if time_seconds > 0 else 0.0
+
+        result = {
+            "start_time": start_time.isoformat() if start_time else None,
+            "end_time": end_time.isoformat(),
+            "start_odometer_km": start_odometer_km,
+            "end_odometer_km": end_odometer_km,
+            "distance_km": round(distance_km, 3),
+            "time_seconds": round(time_seconds, 1),
+            "avg_speed_kmh": round(avg_speed, 1),
+            "energy_kwh": 0.0,
+            "avg_efficiency_km_per_kwh": 0.0,
+            "start_soc": start_soc,
+            "end_soc": end_soc,
+        }
+
+        self.state["external_drive_session"] = {
+            "active": False,
+            "start_time": None,
+            "start_odometer_km": None,
+            "start_soc": None,
+        }
+
+        self.state["last_drive_end_soc"] = end_soc
+
+        return result
 
         start_time = parse_dt(session.get("start_time"))
         start_odometer_km = as_float(session.get("start_odometer_km"))
