@@ -1111,12 +1111,23 @@ class LightLogggPoller:
             self.state["external_drive_pending_start"] = True
             self.state["external_drive_pending_stop"] = False
 
+            self.telegram.send(
+                "외부 주행 시작 신호 수신\n"
+                f"- source: {command.get('source') or '-'}\n"
+                f"- boost: {seconds}초"
+            )
+
             self.save_state()
             return "poll_now"
 
         if name in {"driving_stop", "drive_stop", "stop_driving", "clear_boost"}:
             self.external_drive_boost_until = 0.0
             self.state["external_drive_pending_stop"] = True
+
+            self.telegram.send(
+                "외부 주행 종료 신호 수신\n"
+                f"- source: {command.get('source') or '-'}"
+            )
 
             self.save_state()
             return "poll_now"
@@ -1125,6 +1136,7 @@ class LightLogggPoller:
         self.save_state()
         return "ignored"
 
+    
     def should_boost_driving(self) -> bool:
         return self.external_drive_boost_until > time.time()
 
@@ -1142,12 +1154,11 @@ class LightLogggPoller:
         odo_text = f"{sample.odometer_km:.1f} km" if sample.odometer_km is not None else "확인 불가"
 
         self.telegram.send(
-            "두삼이 주행 시작\n"
+            "두삼이 주행 기록 시작\n"
             f"- 시작 배터리: {soc_text}\n"
             f"- 시작 누적거리: {odo_text}\n"
             "- source: external_http"
         )
-        self.state["external_drive_pending_start"] = False
 
     def handle_external_drive_stop(self, sample: Sample) -> Optional[Dict[str, Any]]:
         session = self.state.get("external_drive_session") or {}
@@ -1156,9 +1167,9 @@ class LightLogggPoller:
 
         if not session.get("active"):
             self.telegram.send(
-                "두삼이 주행 종료 요청 수신\n"
+                "두삼이 주행 종료 처리 실패\n"
                 "- 결과: 종료할 외부 주행 세션 없음\n"
-                "- 원인 후보: driving_start HTTP 실패, poller가 시작 명령을 처리하기 전 stop 수신, 또는 state 초기화"
+                "- 원인 후보: start 신호 미수신, start 처리 전 stop 수신, state 초기화"
             )
             return None
 
@@ -1207,51 +1218,7 @@ class LightLogggPoller:
 
         return result
 
-        start_time = parse_dt(session.get("start_time"))
-        start_odometer_km = as_float(session.get("start_odometer_km"))
-        start_soc = as_float(session.get("start_soc"))
-
-        end_time = sample.time
-        end_odometer_km = sample.odometer_km
-        end_soc = sample.battery_level
-
-        if start_time is not None:
-            time_seconds = max(0.0, (end_time - start_time).total_seconds())
-        else:
-            time_seconds = 0.0
-
-        if start_odometer_km is not None and end_odometer_km is not None:
-            distance_km = max(0.0, end_odometer_km - start_odometer_km)
-        else:
-            distance_km = 0.0
-
-        avg_speed = distance_km / (time_seconds / 3600.0) if time_seconds > 0 else 0.0
-
-        result = {
-            "start_time": start_time.isoformat() if start_time else None,
-            "end_time": end_time.isoformat(),
-            "start_odometer_km": start_odometer_km,
-            "end_odometer_km": end_odometer_km,
-            "distance_km": round(distance_km, 3),
-            "time_seconds": round(time_seconds, 1),
-            "avg_speed_kmh": round(avg_speed, 1),
-            "energy_kwh": 0.0,
-            "avg_efficiency_km_per_kwh": 0.0,
-            "start_soc": start_soc,
-            "end_soc": end_soc,
-        }
-
-        self.state["external_drive_session"] = {
-            "active": False,
-            "start_time": None,
-            "start_odometer_km": None,
-            "start_soc": None,
-        }
-
-        self.state["last_drive_end_soc"] = end_soc
-
-        return result
-
+    
     def send_drive_end_summary(self, session: Dict[str, Any]) -> None:
         distance_km = float(session.get("distance_km") or 0.0)
 
