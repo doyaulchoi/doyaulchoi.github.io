@@ -873,6 +873,62 @@ class TelegramClient:
             return False
 
 
+    def send_document(self, file_path: Path, caption: str = "") -> bool:
+        if not self.enabled:
+            print(f"[telegram disabled] document={file_path}", flush=True)
+            return False
+
+        if not file_path.exists() or not file_path.is_file():
+            print(f"Telegram document missing: {file_path}", file=sys.stderr, flush=True)
+            return False
+
+        file_size = file_path.stat().st_size
+
+        if file_size <= 0:
+            print(f"Telegram document empty: {file_path}", file=sys.stderr, flush=True)
+            return False
+
+        max_bytes = 50 * 1024 * 1024
+
+        if file_size > max_bytes:
+            self.send(
+                "파일이 너무 커서 전송하지 못했습니다.\n"
+                f"- 파일: {file_path.name}\n"
+                f"- 크기: {file_size / 1024 / 1024:.1f} MB"
+            )
+            return False
+
+        url = f"https://api.telegram.org/bot{self.token}/sendDocument"
+
+        try:
+            with file_path.open("rb") as file:
+                response = requests.post(
+                    url,
+                    data={
+                        "chat_id": self.chat_id,
+                        "caption": caption[:1024],
+                    },
+                    files={
+                        "document": (file_path.name, file),
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                )
+
+            if response.status_code >= 400:
+                print(
+                    f"Telegram document error {response.status_code}: {response.text[:300]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return False
+
+            return True
+
+        except requests.RequestException as exc:
+            print(f"Telegram document request failed: {exc}", file=sys.stderr, flush=True)
+            return False
+
+
 # =========================
 # Tesla Fleet API
 # =========================
@@ -1628,6 +1684,10 @@ class LightLogggPoller:
 
         if self.weekly_report_due():
             self.telegram.send(self.build_weekly_report_text())
+            self.telegram.send_document(
+                TRIPS_CSV_FILE,
+                "두삼이 주행 데이터 CSV",
+            )
             self.state["last_weekly_summary_iso"] = current_week
 
 
