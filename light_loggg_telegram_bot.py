@@ -58,6 +58,11 @@ DEFAULT_LOG_FILE = LOG_DIR / "polling.log"
 BOT_LOG_FILE = LOG_DIR / "telegram_bot.log"
 COMMAND_SERVER_LOG_FILE = LOG_DIR / "command_server.log"
 UPDATE_LOG_FILE = LOG_DIR / "update.log"
+BOOT_LOG_FILE = LOG_DIR / "boot.log"
+BOOT_ERROR_LOG_FILE = LOG_DIR / "boot-error.log"
+TRIPS_CSV_FILE = APP_DIR / "data" / "trips.csv"
+
+TELEGRAM_DOCUMENT_LIMIT_BYTES = 50 * 1024 * 1024
 
 COMMAND_SERVER_PID_FILE = APP_DIR / "command_server.pid"
 
@@ -345,6 +350,17 @@ def format_weekly_summary(state: Dict[str, Any]) -> str:
         f"평균전비 {avg_eff:.2f} km/kWh\n"
         f"주행횟수 {int(weekly.get('drive_count') or 0)}회"
     )
+
+
+def get_log_files() -> list[Path]:
+    return [
+        DEFAULT_LOG_FILE,
+        BOT_LOG_FILE,
+        COMMAND_SERVER_LOG_FILE,
+        UPDATE_LOG_FILE,
+        BOOT_LOG_FILE,
+        BOOT_ERROR_LOG_FILE,
+    ]
 
 
 def format_status(state_file: Path) -> str:
@@ -918,6 +934,73 @@ class TelegramBot:
 
             time.sleep(0.2)
 
+
+    def send_document(self, chat_id: str, file_path: Path, caption: str = "") -> None:
+        if not file_path.exists():
+            self.send(chat_id, f"파일 없음: {file_path}")
+            return
+
+        if not file_path.is_file():
+            self.send(chat_id, f"파일이 아님: {file_path}")
+            return
+
+        file_size = file_path.stat().st_size
+
+        if file_size <= 0:
+            self.send(chat_id, f"빈 파일: {file_path.name}")
+            return
+
+        if file_size > TELEGRAM_DOCUMENT_LIMIT_BYTES:
+            self.send(
+                chat_id,
+                "파일이 너무 큼\n"
+                f"- 파일: {file_path.name}\n"
+                f"- 크기: {file_size / 1024 / 1024:.1f} MB",
+            )
+            return
+
+        url = f"https://api.telegram.org/bot{self.token}/sendDocument"
+
+        try:
+            with file_path.open("rb") as file:
+                response = requests.post(
+                    url,
+                    data={
+                        "chat_id": chat_id,
+                        "caption": caption[:1024],
+                    },
+                    files={
+                        "document": (file_path.name, file),
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                )
+
+            if response.status_code >= 400:
+                self.send(
+                    chat_id,
+                    "파일 전송 실패\n"
+                    f"- 파일: {file_path.name}\n"
+                    f"- HTTP: {response.status_code}\n"
+                    f"- 응답: {response.text[:500]}",
+                )
+
+        except requests.RequestException as exc:
+            self.send(
+                chat_id,
+                "파일 전송 요청 실패\n"
+                f"- 파일: {file_path.name}\n"
+                f"- 오류: {exc}",
+            )
+
+        except Exception as exc:
+            self.send(
+                chat_id,
+                "파일 전송 처리 실패\n"
+                f"- 파일: {file_path.name}\n"
+                f"- 오류: {exc}",
+            )
+
+  
     def allowed(self, chat_id: str) -> bool:
         if self.chat_id:
             return str(chat_id) == str(self.chat_id)
@@ -935,7 +1018,9 @@ class TelegramBot:
                 "🤖 LIGHT LOGGG 명령어\n\n"
                 "📊 상태 확인\n"
                 "  /status  - 현재 로거/차량 상태\n"
-                "  /check   - 시스템 진단\n\n"
+                "  /check   - 시스템 진단\n"
+                "  /log     - 실행 로그 파일 전송\n"
+                "  /trips   - 주행 CSV 전송\n\n"
                 "📈 주행 요약\n"
                 "  /daily   - 오늘 주행 요약\n"
                 "  /weekly  - 주간 주행 요약\n\n"
@@ -955,6 +1040,28 @@ class TelegramBot:
 
         elif command in {"/weekly", "weekly"}:
             self.send(chat_id, format_weekly_summary(state))
+            self.send_document(
+                chat_id,
+                TRIPS_CSV_FILE,
+                "두삼이 주행 데이터 CSV",
+            )
+
+        elif command in {"/log", "log", "/logs", "logs"}:
+            self.send(chat_id, "실행 로그 파일 전송을 시작합니다.")
+
+            for log_file in get_log_files():
+                self.send_document(
+                    chat_id,
+                    log_file,
+                    f"LIGHT LOGGG log: {log_file.name}",
+                )
+
+        elif command in {"/trips", "trips", "/drive", "drive", "/drive_data", "drive_data"}:
+            self.send_document(
+                chat_id,
+                TRIPS_CSV_FILE,
+                "두삼이 주행 데이터 CSV",
+            )
 
         elif command in {"/update", "update"}:
             update_and_restart_polling(self, chat_id)
