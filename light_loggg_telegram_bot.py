@@ -1090,7 +1090,7 @@ class TelegramBot:
                 {
                     "command": "driving_start",
                     "source": "telegram",
-                    "seconds": 180,
+                    "seconds": 600,
                     "time": now_kst().isoformat(),
                 }
             )
@@ -1112,7 +1112,9 @@ class TelegramBot:
                 "🤖 LIGHT LOGGG 명령어\n\n"
                 "📊 상태 확인\n"
                 "  /status  - 현재 로거/차량 상태\n"
-                "  /check   - 시스템 진단\n\n"
+                "  /check   - 시스템 진단\n"
+                "  /log     - 실행 로그 파일 전송\n"
+                "  /trips   - 주행 CSV 전송\n\n"
                 "📈 주행 요약\n"
                 "  /daily   - 오늘 주행 요약\n"
                 "  /weekly  - 주간 주행 요약\n\n"
