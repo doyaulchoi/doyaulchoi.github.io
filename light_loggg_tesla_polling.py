@@ -78,6 +78,8 @@ VEHICLE_DATA_ENDPOINTS_WITHOUT_LOCATION = ";".join(
     endpoint for endpoint in VEHICLE_DATA_ENDPOINT_LIST if endpoint != "location_data"
 )
 
+LOCATION_DATA_ENDPOINTS = "location_data"
+
 DEFAULT_TESLA_SCOPE = "openid offline_access user_data vehicle_device_data"
 
 DEFAULT_PUBLIC_CONFIG: Dict[str, Any] = {
@@ -218,10 +220,10 @@ def cfg_bool(config: Dict[str, Any], section: str, key: str, env_key: str, defau
 PUBLIC_CONFIG: Dict[str, Any] = dict(DEFAULT_PUBLIC_CONFIG)
 
 POLL_ASLEEP_SECONDS = 1800
-POLL_ONLINE_SECONDS = 300
-POLL_DRIVING_SECONDS = 10
-POLL_CHARGING_SECONDS = 60
-POLL_ERROR_SECONDS = 300
+POLL_ONLINE_SECONDS = 900
+POLL_DRIVING_SECONDS = 900
+POLL_CHARGING_SECONDS = 300
+POLL_ERROR_SECONDS = 900
 
 WINDOW_SIZE_MINUTES = 3.0
 THRESHOLD_EFFICIENCY = 4.5
@@ -255,16 +257,16 @@ def init_runtime_config(config_file: Path) -> None:
         PUBLIC_CONFIG, "polling", "asleep_seconds", "LIGHT_LOGGG_POLL_ASLEEP_SECONDS", 1800
     )
     POLL_ONLINE_SECONDS = cfg_int(
-        PUBLIC_CONFIG, "polling", "online_seconds", "LIGHT_LOGGG_POLL_ONLINE_SECONDS", 300
+        PUBLIC_CONFIG, "polling", "online_seconds", "LIGHT_LOGGG_POLL_ONLINE_SECONDS", 900
     )
     POLL_DRIVING_SECONDS = cfg_int(
         PUBLIC_CONFIG, "polling", "driving_seconds", "LIGHT_LOGGG_POLL_DRIVING_SECONDS", 300
     )
     POLL_CHARGING_SECONDS = cfg_int(
-        PUBLIC_CONFIG, "polling", "charging_seconds", "LIGHT_LOGGG_POLL_CHARGING_SECONDS", 300
+        PUBLIC_CONFIG, "polling", "charging_seconds", "LIGHT_LOGGG_POLL_CHARGING_SECONDS", 900
     )
     POLL_ERROR_SECONDS = cfg_int(
-        PUBLIC_CONFIG, "polling", "error_seconds", "LIGHT_LOGGG_POLL_ERROR_SECONDS", 300
+        PUBLIC_CONFIG, "polling", "error_seconds", "LIGHT_LOGGG_POLL_ERROR_SECONDS", 900
     )
 
     WINDOW_SIZE_MINUTES = cfg_float(
@@ -477,6 +479,122 @@ def format_seconds_hm(seconds_value: Optional[float]) -> str:
     return f"{hours}시간"
 
 
+def extract_location_from_vehicle_data(
+    vehicle_data: Optional[Dict[str, Any]],
+) -> Tuple[Optional[float], Optional[float]]:
+    if not vehicle_data:
+        return None, None
+
+    candidates = [
+        vehicle_data.get("drive_state") or {},
+        vehicle_data.get("location_data") or {},
+        vehicle_data.get("vehicle_state") or {},
+        vehicle_data,
+    ]
+
+    key_pairs = [
+        ("latitude", "longitude"),
+        ("lat", "lon"),
+        ("lat", "lng"),
+    ]
+
+    for source in candidates:
+        if not isinstance(source, dict):
+            continue
+
+        for lat_key, lon_key in key_pairs:
+            latitude = as_float(source.get(lat_key))
+            longitude = as_float(source.get(lon_key))
+
+            if latitude is not None and longitude is not None:
+                return latitude, longitude
+
+    return None, None
+
+
+def reverse_geocode_korean(
+    latitude: Optional[float],
+    longitude: Optional[float],
+) -> Optional[str]:
+    if latitude is None or longitude is None:
+        return None
+
+    api_key = (
+        os.getenv("KAKAO_REST_API_KEY")
+        or os.getenv("KAKAO_API_KEY")
+        or os.getenv("LIGHT_LOGGG_KAKAO_REST_API_KEY")
+    )
+
+    if not api_key:
+        return None
+
+    url = "https://dapi.kakao.com/v2/local/geo/coord2address.json"
+
+    try:
+        response = requests.get(
+            url,
+            params={
+                "x": longitude,
+                "y": latitude,
+                "input_coord": "WGS84",
+            },
+            headers={
+                "Authorization": f"KakaoAK {api_key}",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        if response.status_code != 200:
+            print(
+                f"Kakao reverse geocode failed: HTTP {response.status_code} {response.text[:300]}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+
+        data = response.json()
+        documents = data.get("documents") or []
+
+        if not documents:
+            return None
+
+        first = documents[0] or {}
+        road_address = first.get("road_address") or {}
+        address = first.get("address") or {}
+
+        road_text = road_address.get("address_name")
+        address_text = address.get("address_name")
+
+        if road_text:
+            return str(road_text)
+
+        if address_text:
+            return str(address_text)
+
+        return None
+
+    except requests.RequestException as exc:
+        print(f"Kakao reverse geocode request failed: {exc}", file=sys.stderr, flush=True)
+        return None
+    except Exception as exc:
+        print(f"Kakao reverse geocode parse failed: {exc}", file=sys.stderr, flush=True)
+        return None
+
+
+def format_location_text(
+    latitude: Optional[float],
+    longitude: Optional[float],
+    address: Optional[str],
+) -> str:
+    if address:
+        return address
+
+    if latitude is not None and longitude is not None:
+        return f"{latitude:.6f}, {longitude:.6f}"
+
+    return "확인 불가"
+
+
 TRIP_CSV_FIELDS = [
     "date",
     "source",
@@ -490,6 +608,12 @@ TRIP_CSV_FIELDS = [
     "soc_used_pct",
     "start_odometer_km",
     "end_odometer_km",
+    "start_latitude",
+    "start_longitude",
+    "start_address",
+    "end_latitude",
+    "end_longitude",
+    "end_address",
 ]
 
 
@@ -525,6 +649,11 @@ def append_trip_csv(csv_file: Path, session: Dict[str, Any], source: str) -> Non
     start_odometer_km = as_float(session.get("start_odometer_km"))
     end_odometer_km = as_float(session.get("end_odometer_km"))
 
+    start_latitude = as_float(session.get("start_latitude"))
+    start_longitude = as_float(session.get("start_longitude"))
+    end_latitude = as_float(session.get("end_latitude"))
+    end_longitude = as_float(session.get("end_longitude"))
+
     row = {
         "date": date_text,
         "source": source,
@@ -538,6 +667,12 @@ def append_trip_csv(csv_file: Path, session: Dict[str, Any], source: str) -> Non
         "soc_used_pct": round(soc_used_pct, 1) if soc_used_pct is not None else "",
         "start_odometer_km": round(start_odometer_km, 3) if start_odometer_km is not None else "",
         "end_odometer_km": round(end_odometer_km, 3) if end_odometer_km is not None else "",
+        "start_latitude": round(start_latitude, 7) if start_latitude is not None else "",
+        "start_longitude": round(start_longitude, 7) if start_longitude is not None else "",
+        "start_address": session.get("start_address") or "",
+        "end_latitude": round(end_latitude, 7) if end_latitude is not None else "",
+        "end_longitude": round(end_longitude, 7) if end_longitude is not None else "",
+        "end_address": session.get("end_address") or "",
     }
 
     csv_file.parent.mkdir(parents=True, exist_ok=True)
@@ -566,6 +701,7 @@ class Sample:
     battery_level: Optional[float]
     latitude: Optional[float]
     longitude: Optional[float]
+    address: Optional[str] = None
     shift_state: Optional[str] = None
     charging_state: Optional[str] = None
 
@@ -576,6 +712,9 @@ class DriveSession:
     start_time: Optional[datetime] = None
     start_odometer_km: Optional[float] = None
     start_soc: Optional[float] = None
+    start_latitude: Optional[float] = None
+    start_longitude: Optional[float] = None
+    start_address: Optional[str] = None
     last_sample_time: Optional[datetime] = None
     last_odometer_km: Optional[float] = None
     last_speed_kmh: Optional[float] = None
@@ -590,6 +729,9 @@ class DriveSession:
         self.start_time = sample.time
         self.start_odometer_km = sample.odometer_km
         self.start_soc = sample.battery_level
+        self.start_latitude = sample.latitude
+        self.start_longitude = sample.longitude
+        self.start_address = sample.address
         self.last_sample_time = sample.time
         self.last_odometer_km = sample.odometer_km
         self.last_speed_kmh = sample.speed_kmh
@@ -652,6 +794,12 @@ class DriveSession:
             "avg_efficiency_km_per_kwh": round(avg_eff, 2),
             "start_soc": self.start_soc,
             "end_soc": sample.battery_level,
+            "start_latitude": self.start_latitude,
+            "start_longitude": self.start_longitude,
+            "start_address": self.start_address,
+            "end_latitude": sample.latitude,
+            "end_longitude": sample.longitude,
+            "end_address": sample.address,
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -660,6 +808,9 @@ class DriveSession:
             "start_time": self.start_time.isoformat() if self.start_time else None,
             "start_odometer_km": self.start_odometer_km,
             "start_soc": self.start_soc,
+            "start_latitude": self.start_latitude,
+            "start_longitude": self.start_longitude,
+            "start_address": self.start_address,
             "last_sample_time": self.last_sample_time.isoformat() if self.last_sample_time else None,
             "last_odometer_km": self.last_odometer_km,
             "last_speed_kmh": self.last_speed_kmh,
@@ -675,6 +826,9 @@ class DriveSession:
         drive.start_time = parse_dt(data.get("start_time"))
         drive.start_odometer_km = as_float(data.get("start_odometer_km"))
         drive.start_soc = as_float(data.get("start_soc"))
+        drive.start_latitude = as_float(data.get("start_latitude"))
+        drive.start_longitude = as_float(data.get("start_longitude"))
+        drive.start_address = data.get("start_address")
         drive.last_sample_time = parse_dt(data.get("last_sample_time"))
         drive.last_odometer_km = as_float(data.get("last_odometer_km"))
         drive.last_speed_kmh = as_float(data.get("last_speed_kmh"))
@@ -682,7 +836,6 @@ class DriveSession:
         drive.time_seconds = float(data.get("time_seconds") or 0.0)
         drive.energy_kwh = float(data.get("energy_kwh") or 0.0)
         return drive
-
 
 # =========================
 # Telegram
@@ -921,6 +1074,53 @@ class TeslaFleetClient:
         return status, vehicle_data
 
 
+    def fetch_location_data(self, vehicle_id: str) -> Optional[Dict[str, Any]]:
+        if not vehicle_id:
+            return None
+
+        if not self.access_token_valid():
+            self.refresh()
+
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+        }
+
+        data_url = (
+            f"{self.api_base}/api/1/vehicles/{vehicle_id}/vehicle_data"
+            f"?endpoints={LOCATION_DATA_ENDPOINTS}"
+        )
+
+        response = self.session.get(data_url, headers=headers, timeout=REQUEST_TIMEOUT)
+
+        if response.status_code == 401:
+            self.refresh()
+            headers["Authorization"] = f"Bearer {self.access_token}"
+            response = self.session.get(data_url, headers=headers, timeout=REQUEST_TIMEOUT)
+
+        if response.status_code == 403:
+            print(
+                f"Tesla location_data forbidden: HTTP {response.status_code} {response.text[:300]}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+
+        if response.status_code != 200:
+            print(
+                f"Tesla location_data failed: HTTP {response.status_code} {response.text[:300]}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+
+        vehicle_data = response.json().get("response")
+
+        if not isinstance(vehicle_data, dict):
+            return None
+
+        return vehicle_data
+
+
 # =========================
 # Main poller
 # =========================
@@ -1147,18 +1347,14 @@ class LightLogggPoller:
             "start_time": sample.time.isoformat(),
             "start_odometer_km": sample.odometer_km,
             "start_soc": sample.battery_level,
+            "start_latitude": sample.latitude,
+            "start_longitude": sample.longitude,
+            "start_address": sample.address,
         }
+
         self.state["external_drive_pending_start"] = False
 
-        soc_text = f"{sample.battery_level:.0f}%" if sample.battery_level is not None else "확인 불가"
-        odo_text = f"{sample.odometer_km:.1f} km" if sample.odometer_km is not None else "확인 불가"
-
-        self.telegram.send(
-            "두삼이 주행 기록 시작\n"
-            f"- 시작 배터리: {soc_text}\n"
-            f"- 시작 누적거리: {odo_text}\n"
-            "- source: external_http"
-        )
+        self.send_drive_start_summary(sample)
 
     def handle_external_drive_stop(self, sample: Sample) -> Optional[Dict[str, Any]]:
         session = self.state.get("external_drive_session") or {}
@@ -1166,20 +1362,23 @@ class LightLogggPoller:
         self.state["external_drive_pending_stop"] = False
 
         if not session.get("active"):
-            self.telegram.send(
-                "두삼이 주행 종료 처리 실패\n"
-                "- 결과: 종료할 외부 주행 세션 없음\n"
-                "- 원인 후보: start 신호 미수신, start 처리 전 stop 수신, state 초기화"
-            )
             return None
 
         start_time = parse_dt(session.get("start_time"))
         start_odometer_km = as_float(session.get("start_odometer_km"))
         start_soc = as_float(session.get("start_soc"))
 
+        start_latitude = as_float(session.get("start_latitude"))
+        start_longitude = as_float(session.get("start_longitude"))
+        start_address = session.get("start_address")
+
         end_time = sample.time
         end_odometer_km = sample.odometer_km
         end_soc = sample.battery_level
+
+        end_latitude = sample.latitude
+        end_longitude = sample.longitude
+        end_address = sample.address
 
         if start_time is not None:
             time_seconds = max(0.0, (end_time - start_time).total_seconds())
@@ -1190,6 +1389,17 @@ class LightLogggPoller:
             distance_km = max(0.0, end_odometer_km - start_odometer_km)
         else:
             distance_km = 0.0
+
+        if distance_km <= 0:
+            gps_distance_km = haversine_km(
+                start_latitude,
+                start_longitude,
+                end_latitude,
+                end_longitude,
+            )
+
+            if gps_distance_km is not None:
+                distance_km = gps_distance_km
 
         avg_speed = distance_km / (time_seconds / 3600.0) if time_seconds > 0 else 0.0
 
@@ -1205,6 +1415,12 @@ class LightLogggPoller:
             "avg_efficiency_km_per_kwh": 0.0,
             "start_soc": start_soc,
             "end_soc": end_soc,
+            "start_latitude": start_latitude,
+            "start_longitude": start_longitude,
+            "start_address": start_address,
+            "end_latitude": end_latitude,
+            "end_longitude": end_longitude,
+            "end_address": end_address,
         }
 
         self.state["external_drive_session"] = {
@@ -1212,6 +1428,9 @@ class LightLogggPoller:
             "start_time": None,
             "start_odometer_km": None,
             "start_soc": None,
+            "start_latitude": None,
+            "start_longitude": None,
+            "start_address": None,
         }
 
         self.state["last_drive_end_soc"] = end_soc
@@ -1219,12 +1438,27 @@ class LightLogggPoller:
         return result
 
     
+    def send_drive_start_summary(self, sample: Sample) -> None:
+        battery_text = f"{sample.battery_level:.0f}%" if sample.battery_level is not None else "확인 불가"
+        odometer_text = f"{sample.odometer_km:.1f} km" if sample.odometer_km is not None else "확인 불가"
+
+        location_text = format_location_text(
+            sample.latitude,
+            sample.longitude,
+            sample.address,
+        )
+
+        self.telegram.send(
+            "두삼이 주행 시작\n"
+            f"- 시작시각: {sample.time.astimezone(KST).strftime('%H:%M:%S')}\n"
+            f"- 배터리: {battery_text}\n"
+            f"- 누적 주행거리: {odometer_text}\n"
+            f"- 출발위치: {location_text}"
+        )
+
+
     def send_drive_end_summary(self, session: Dict[str, Any]) -> None:
         distance_km = float(session.get("distance_km") or 0.0)
-
-        if distance_km < 1.0:
-            return
-
         time_seconds = float(session.get("time_seconds") or 0.0)
         avg_speed = float(session.get("avg_speed_kmh") or 0.0)
 
@@ -1244,12 +1478,26 @@ class LightLogggPoller:
             minutes = int(round(time_seconds / 60))
             duration_text = f"{minutes}분"
 
+        start_location_text = format_location_text(
+            as_float(session.get("start_latitude")),
+            as_float(session.get("start_longitude")),
+            session.get("start_address"),
+        )
+
+        end_location_text = format_location_text(
+            as_float(session.get("end_latitude")),
+            as_float(session.get("end_longitude")),
+            session.get("end_address"),
+        )
+
         self.telegram.send(
             "두삼이 주행 종료\n"
             f"- 주행거리: {distance_km:.2f} km\n"
             f"- 주행시간: {duration_text}\n"
             f"- 배터리: {battery_text}\n"
-            f"- 평균속도: {avg_speed:.1f} km/h"
+            f"- 평균속도: {avg_speed:.1f} km/h\n"
+            f"- 출발위치: {start_location_text}\n"
+            f"- 도착위치: {end_location_text}"
         )
 
 
@@ -1397,7 +1645,33 @@ class LightLogggPoller:
         charge_state = vehicle.get("charge_state") or {}
         return charge_state.get("charging_state") == "Charging"
 
-    def sample_from_vehicle(self, vehicle: Dict[str, Any]) -> Sample:
+    def fetch_current_location(
+        self,
+        vehicle: Dict[str, Any],
+    ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+        vehicle_id = str(
+            vehicle.get("id_s")
+            or vehicle.get("id")
+            or self.vehicle_id
+            or ""
+        )
+
+        location_vehicle = self.client.fetch_location_data(vehicle_id) if vehicle_id else None
+
+        latitude, longitude = extract_location_from_vehicle_data(location_vehicle)
+
+        if latitude is None or longitude is None:
+            latitude, longitude = extract_location_from_vehicle_data(vehicle)
+
+        address = reverse_geocode_korean(latitude, longitude)
+
+        return latitude, longitude, address
+
+    def sample_from_vehicle(
+        self,
+        vehicle: Dict[str, Any],
+        include_location: bool = False,
+    ) -> Sample:
         drive_state = vehicle.get("drive_state") or {}
         charge_state = vehicle.get("charge_state") or {}
         vehicle_state = vehicle.get("vehicle_state") or {}
@@ -1408,14 +1682,22 @@ class LightLogggPoller:
         charger_power = as_float(charge_state.get("charger_power"))
         power_kw = drive_power if drive_power is not None else charger_power
 
+        latitude = None
+        longitude = None
+        address = None
+
+        if include_location:
+            latitude, longitude, address = self.fetch_current_location(vehicle)
+
         return Sample(
             time=now_kst(),
             speed_kmh=speed_mph_to_kmh(speed_mph),
             power_kw=power_kw,
             odometer_km=miles_to_km(odometer_miles),
             battery_level=as_float(charge_state.get("battery_level")),
-            latitude=None,
-            longitude=None,
+            latitude=latitude,
+            longitude=longitude,
+            address=address,
             shift_state=drive_state.get("shift_state"),
             charging_state=charge_state.get("charging_state"),
         )
@@ -1794,7 +2076,15 @@ class LightLogggPoller:
             self.save_state()
             return interval
 
-        sample = self.sample_from_vehicle(vehicle)
+        needs_location = bool(
+            self.state.get("external_drive_pending_start")
+            or self.state.get("external_drive_pending_stop")
+        )
+
+        sample = self.sample_from_vehicle(
+            vehicle,
+            include_location=needs_location,
+        )
 
         if self.state.get("external_drive_pending_start"):
             self.handle_external_drive_start(sample)
